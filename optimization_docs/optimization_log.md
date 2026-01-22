@@ -32,9 +32,17 @@
 - Saves ~80 cycles from normal→normal transitions
 - Also added level 2 → level 3 pipelining (saves additional ~20 cycles)
 
+### 6. Skip Last Round Index Calculation (2952 → 2916 cycles)
+- Last round (round 15) doesn't need index calculation
+- Indices are not used after the final round
+- Saves 160 VALU ops (8 vectors × 5 ops × 4 sub-batches)
+- Combined hash stage 0 into single 6-op cycle for last round
+
 ## Current State
-- Cycles: 2952
-- Speedup: 50.0x over baseline
+- Cycles: 2916
+- Speedup: 50.7x over baseline
+- Total VALU ops: 9724 (reduced from 9884)
+- VALU efficiency: 55.6%
 
 ## Bundle Analysis (2973 cycles)
 - VALU-only: 1458 cycles (49.0%)
