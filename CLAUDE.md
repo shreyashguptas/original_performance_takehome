@@ -1,0 +1,5 @@
+# Project Rules
+- Add a dedicated memory for this project. Create a folder called "optimization_docs" where there will be a file named "optimization_log." Document breakthroughs and milestones in this log immediately after they occur, along with the corresponding steps. Any findings from online research or results from code changes, whether good or bad, should be documented in "optimization_findings.md." This ensures we know what optimizations to pursue and what to avoid, along with the reasons for these decisions
+- Maintain this memory to ensure no milestones are overlooked.
+- If obstacles arise, research online for solutions related to the specific problems encountered.
+- Strive for optimizations, no matter how minor, and seek examples of significant breakthroughs by others to improve our code
