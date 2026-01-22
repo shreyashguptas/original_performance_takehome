@@ -136,8 +136,9 @@ class KernelBuilder:
             ])
 
     def emit_index_calc_8vec(self, v_idx, v_hash, v_cond, v_tmp1, v_one, v_two, v_n_nodes):
-        """Emit optimized index calculation for 8 vectors using 6 VALU slots per cycle."""
-        # Step 1: cond = hash & 1 (8 ops, 2 cycles)
+        """Emit pipelined index calculation for 8 vectors (7 cycles instead of 10).
+        Pipeline stages across vectors to maximize VALU utilization."""
+        # Cycle 1: step1 for v0-5
         self.add_vliw([
             ("valu", ("&", v_cond[0], v_hash[0], v_one)),
             ("valu", ("&", v_cond[1], v_hash[1], v_one)),
@@ -146,37 +147,34 @@ class KernelBuilder:
             ("valu", ("&", v_cond[4], v_hash[4], v_one)),
             ("valu", ("&", v_cond[5], v_hash[5], v_one)),
         ])
+        # Cycle 2: step1 for v6-7 + step2 for v0-3
         self.add_vliw([
             ("valu", ("&", v_cond[6], v_hash[6], v_one)),
             ("valu", ("&", v_cond[7], v_hash[7], v_one)),
-        ])
-        # Step 2: cond = 1 + cond (8 ops, 2 cycles)
-        self.add_vliw([
             ("valu", ("+", v_cond[0], v_one, v_cond[0])),
             ("valu", ("+", v_cond[1], v_one, v_cond[1])),
             ("valu", ("+", v_cond[2], v_one, v_cond[2])),
             ("valu", ("+", v_cond[3], v_one, v_cond[3])),
+        ])
+        # Cycle 3: step2 for v4-7 + step3 for v0-1
+        self.add_vliw([
             ("valu", ("+", v_cond[4], v_one, v_cond[4])),
             ("valu", ("+", v_cond[5], v_one, v_cond[5])),
-        ])
-        self.add_vliw([
             ("valu", ("+", v_cond[6], v_one, v_cond[6])),
             ("valu", ("+", v_cond[7], v_one, v_cond[7])),
-        ])
-        # Step 3: idx = idx * 2 + cond (8 ops, 2 cycles)
-        self.add_vliw([
             ("valu", ("multiply_add", v_idx[0], v_idx[0], v_two, v_cond[0])),
             ("valu", ("multiply_add", v_idx[1], v_idx[1], v_two, v_cond[1])),
+        ])
+        # Cycle 4: step3 for v2-7
+        self.add_vliw([
             ("valu", ("multiply_add", v_idx[2], v_idx[2], v_two, v_cond[2])),
             ("valu", ("multiply_add", v_idx[3], v_idx[3], v_two, v_cond[3])),
             ("valu", ("multiply_add", v_idx[4], v_idx[4], v_two, v_cond[4])),
             ("valu", ("multiply_add", v_idx[5], v_idx[5], v_two, v_cond[5])),
-        ])
-        self.add_vliw([
             ("valu", ("multiply_add", v_idx[6], v_idx[6], v_two, v_cond[6])),
             ("valu", ("multiply_add", v_idx[7], v_idx[7], v_two, v_cond[7])),
         ])
-        # Step 4: tmp = idx < n_nodes (8 ops, 2 cycles)
+        # Cycle 5: step4 for v0-5
         self.add_vliw([
             ("valu", ("<", v_tmp1[0], v_idx[0], v_n_nodes)),
             ("valu", ("<", v_tmp1[1], v_idx[1], v_n_nodes)),
@@ -185,20 +183,19 @@ class KernelBuilder:
             ("valu", ("<", v_tmp1[4], v_idx[4], v_n_nodes)),
             ("valu", ("<", v_tmp1[5], v_idx[5], v_n_nodes)),
         ])
+        # Cycle 6: step4 for v6-7 + step5 for v0-3
         self.add_vliw([
             ("valu", ("<", v_tmp1[6], v_idx[6], v_n_nodes)),
             ("valu", ("<", v_tmp1[7], v_idx[7], v_n_nodes)),
-        ])
-        # Step 5: idx = idx * tmp (wrap to 0 if >= n_nodes) (8 ops, 2 cycles)
-        self.add_vliw([
             ("valu", ("*", v_idx[0], v_idx[0], v_tmp1[0])),
             ("valu", ("*", v_idx[1], v_idx[1], v_tmp1[1])),
             ("valu", ("*", v_idx[2], v_idx[2], v_tmp1[2])),
             ("valu", ("*", v_idx[3], v_idx[3], v_tmp1[3])),
+        ])
+        # Cycle 7: step5 for v4-7
+        self.add_vliw([
             ("valu", ("*", v_idx[4], v_idx[4], v_tmp1[4])),
             ("valu", ("*", v_idx[5], v_idx[5], v_tmp1[5])),
-        ])
-        self.add_vliw([
             ("valu", ("*", v_idx[6], v_idx[6], v_tmp1[6])),
             ("valu", ("*", v_idx[7], v_idx[7], v_tmp1[7])),
         ])
@@ -733,32 +730,47 @@ class KernelBuilder:
                             ("valu", (op2, v_hash[b][7], v_tmp1[7], v_tmp2[7])),
                         ])
 
-                    # Index calc for v2-v7
-                    for j in range(2, UNROLL, 2):
-                        self.add_vliw([
-                            ("valu", ("&", v_cond[j], v_hash[b][j], v_one)),
-                            ("valu", ("&", v_cond[j+1], v_hash[b][j+1], v_one)),
-                        ])
-                    for j in range(2, UNROLL, 2):
-                        self.add_vliw([
-                            ("valu", ("+", v_cond[j], v_one, v_cond[j])),
-                            ("valu", ("+", v_cond[j+1], v_one, v_cond[j+1])),
-                        ])
-                    for j in range(2, UNROLL, 2):
-                        self.add_vliw([
-                            ("valu", ("multiply_add", v_idx[b][j], v_idx[b][j], v_two, v_cond[j])),
-                            ("valu", ("multiply_add", v_idx[b][j+1], v_idx[b][j+1], v_two, v_cond[j+1])),
-                        ])
-                    for j in range(2, UNROLL, 2):
-                        self.add_vliw([
-                            ("valu", ("<", v_tmp1[j], v_idx[b][j], v_n_nodes)),
-                            ("valu", ("<", v_tmp1[j+1], v_idx[b][j+1], v_n_nodes)),
-                        ])
-                    for j in range(2, UNROLL, 2):
-                        self.add_vliw([
-                            ("valu", ("*", v_idx[b][j], v_idx[b][j], v_tmp1[j])),
-                            ("valu", ("*", v_idx[b][j+1], v_idx[b][j+1], v_tmp1[j+1])),
-                        ])
+                    # Optimized index calc for v2-v7 (6 vectors = 6 ops per step = 1 cycle per step)
+                    self.add_vliw([
+                        ("valu", ("&", v_cond[2], v_hash[b][2], v_one)),
+                        ("valu", ("&", v_cond[3], v_hash[b][3], v_one)),
+                        ("valu", ("&", v_cond[4], v_hash[b][4], v_one)),
+                        ("valu", ("&", v_cond[5], v_hash[b][5], v_one)),
+                        ("valu", ("&", v_cond[6], v_hash[b][6], v_one)),
+                        ("valu", ("&", v_cond[7], v_hash[b][7], v_one)),
+                    ])
+                    self.add_vliw([
+                        ("valu", ("+", v_cond[2], v_one, v_cond[2])),
+                        ("valu", ("+", v_cond[3], v_one, v_cond[3])),
+                        ("valu", ("+", v_cond[4], v_one, v_cond[4])),
+                        ("valu", ("+", v_cond[5], v_one, v_cond[5])),
+                        ("valu", ("+", v_cond[6], v_one, v_cond[6])),
+                        ("valu", ("+", v_cond[7], v_one, v_cond[7])),
+                    ])
+                    self.add_vliw([
+                        ("valu", ("multiply_add", v_idx[b][2], v_idx[b][2], v_two, v_cond[2])),
+                        ("valu", ("multiply_add", v_idx[b][3], v_idx[b][3], v_two, v_cond[3])),
+                        ("valu", ("multiply_add", v_idx[b][4], v_idx[b][4], v_two, v_cond[4])),
+                        ("valu", ("multiply_add", v_idx[b][5], v_idx[b][5], v_two, v_cond[5])),
+                        ("valu", ("multiply_add", v_idx[b][6], v_idx[b][6], v_two, v_cond[6])),
+                        ("valu", ("multiply_add", v_idx[b][7], v_idx[b][7], v_two, v_cond[7])),
+                    ])
+                    self.add_vliw([
+                        ("valu", ("<", v_tmp1[2], v_idx[b][2], v_n_nodes)),
+                        ("valu", ("<", v_tmp1[3], v_idx[b][3], v_n_nodes)),
+                        ("valu", ("<", v_tmp1[4], v_idx[b][4], v_n_nodes)),
+                        ("valu", ("<", v_tmp1[5], v_idx[b][5], v_n_nodes)),
+                        ("valu", ("<", v_tmp1[6], v_idx[b][6], v_n_nodes)),
+                        ("valu", ("<", v_tmp1[7], v_idx[b][7], v_n_nodes)),
+                    ])
+                    self.add_vliw([
+                        ("valu", ("*", v_idx[b][2], v_idx[b][2], v_tmp1[2])),
+                        ("valu", ("*", v_idx[b][3], v_idx[b][3], v_tmp1[3])),
+                        ("valu", ("*", v_idx[b][4], v_idx[b][4], v_tmp1[4])),
+                        ("valu", ("*", v_idx[b][5], v_idx[b][5], v_tmp1[5])),
+                        ("valu", ("*", v_idx[b][6], v_idx[b][6], v_tmp1[6])),
+                        ("valu", ("*", v_idx[b][7], v_idx[b][7], v_tmp1[7])),
+                    ])
 
         # ================================================================
         # PHASE END: Store all hash values
