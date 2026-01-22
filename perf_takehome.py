@@ -934,9 +934,13 @@ class KernelBuilder:
                                         load_j += 1
                             self.add_vliw(slots)
 
-                    # Finish remaining loads
+                    # Finish remaining loads while XORing already-loaded vectors
+                    # Track which vectors are fully loaded (load_j is current, vectors < load_j are done)
+                    xor_j = 2  # Start XOR from v2
+                    prev_load_j = load_j  # Vectors < prev_load_j are fully loaded at start of this section
                     while load_j < UNROLL:
                         slots = []
+                        # Do 2 loads
                         for _ in range(2):
                             if load_j < UNROLL:
                                 slots.append(("load", ("load", v_node_val[load_j] + load_k, s_addr[load_j][load_k])))
@@ -944,15 +948,24 @@ class KernelBuilder:
                                 if load_k >= VLEN:
                                     load_k = 0
                                     load_j += 1
+                        # XOR vectors that were fully loaded BEFORE this cycle
+                        # (vector j is fully loaded when load_j > j at the START of a cycle)
+                        while xor_j < prev_load_j and xor_j < UNROLL and len([s for s in slots if s[0] == "valu"]) < 6:
+                            slots.append(("valu", ("^", v_hash[b][xor_j], v_hash[b][xor_j], v_node_val[xor_j])))
+                            xor_j += 1
                         if slots:
                             self.add_vliw(slots)
+                        prev_load_j = load_j  # Update for next cycle
 
-                    # XOR v2-v7
-                    for j in range(2, UNROLL, 2):
-                        self.add_vliw([
-                            ("valu", ("^", v_hash[b][j], v_hash[b][j], v_node_val[j])),
-                            ("valu", ("^", v_hash[b][j+1], v_hash[b][j+1], v_node_val[j+1])),
-                        ])
+                    # XOR remaining vectors
+                    while xor_j < UNROLL:
+                        end_j = min(xor_j + 6, UNROLL)  # Up to 6 VALU ops per cycle
+                        slots = []
+                        for j in range(xor_j, end_j):
+                            slots.append(("valu", ("^", v_hash[b][j], v_hash[b][j], v_node_val[j])))
+                        xor_j = end_j
+                        if slots:
+                            self.add_vliw(slots)
 
                     # Hash v2-v7 stage 0 with multiply_add + overlapped v0-v1 index calc
                     # Stage 0 uses + combiner, so use multiply_add (2 cycles for 6 vectors)
