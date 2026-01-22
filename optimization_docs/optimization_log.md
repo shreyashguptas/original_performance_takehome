@@ -1,64 +1,72 @@
 # VLIW SIMD Kernel Optimization Log
 
-## Current Status
-- **Cycles**: ~4,837
-- **Speedup**: ~30.5x (from baseline 147,734)
-- **Target**: < 1,400 cycles (~105x speedup)
+## Starting Point
+- Initial cycles: ~4000
+- Target: <1400 cycles
 
-## Implemented Optimizations
+## Optimizations Applied
 
-### Level 0 Tree Optimization (Rounds 0, 11)
-- **Insight**: At level 0, all 256 elements access forest_values[0]
-- **Implementation**: 1 load + broadcast instead of 64 indirect loads
-- **Savings**: ~30 cycles per batch-round
+### 1. Multiply-Add Fusion (3994 → 3695 cycles)
+- Fused hash stages 0, 2, 4 which use + combiner
+- `(hash + const1) + (hash << shift)` becomes `hash * mult + const1`
+- Saves 1 cycle per fused stage (3 stages per hash = 3 cycles per hash)
 
-### Level 1 Tree Optimization (Rounds 1, 12)
-- **Insight**: At level 1, indices are 1 or 2 (only 2 values)
-- **Implementation**: 2 loads + vselect instead of 64 indirect loads
-- **Savings**: ~24 cycles per batch-round (limited by vselect 1 slot/cycle)
+### 2. Cross-Sub-Batch Pipelining (3352 → 3052 cycles)
+- During hash v2-v7 stages 1-5 (VALU-only), overlap with:
+  - Address calculation for next sub-batch (ALU)
+  - v0-v1 tree value loads for next sub-batch (Load)
+- For sub-batches 1-3, skip pre-computed v0-v1 address calc and loads
+- Key: track prev_alu_ops_done for VLIW timing (writes at end of cycle)
 
-### Level 2 Arithmetic Selection (Rounds 2, 13)
-- **Insight**: At level 2, indices are 3, 4, 5, 6 (only 4 values)
-- **Implementation**: Load 4 values, use `result = sum(val[i] * (offset == i))`
-- **VALU operations**: offset calc + 4 eq checks + 4 multiply/add = ~18 cycles
-- **Savings**: ~14 cycles per batch-round vs indirect loads (32 cycles)
+### 3. Load/XOR Overlap
+- XOR vectors as they finish loading
+- Track which vectors are fully loaded before XORing
 
-### Improved Address Calculation
-- **Previous**: 8 ALU ops per cycle (1 vector at a time) = 8 cycles
-- **Improved**: 12 ALU ops per cycle (packed addresses) = 6 cycles
-- **Savings**: 2 cycles per normal batch-round × 40 = 80 cycles total
+### 4. Level 1 vselect Pipelining
+- Overlap vselect operations with XOR operations
 
-## Attempted Optimizations (Not Successful)
+### 5. Cross-Round Pipelining (3052 → 2952 cycles)
+- Extended pipelining to work across round boundaries
+- During round N's last sub-batch (b=3), pipeline for round N+1's first sub-batch
+- When next round starts, skip pre-loaded work
+- Saves ~80 cycles from normal→normal transitions
+- Also added level 2 → level 3 pipelining (saves additional ~20 cycles)
 
-### Level 3 Arithmetic Selection
-- **Approach**: Load 8 tree values, use arithmetic to select correct one
-- **Result**: SLOWER than indirect loads (5057 vs 4837 cycles)
-- **Issue**: 8 equality checks + 8 multiply_add = 32 VALU cycles, same as 64 loads
-- **Key insight**: Indirect loads can overlap with hash (uses load slots), but arithmetic selection competes with hash (both use VALU)
+## Current State
+- Cycles: 2952
+- Speedup: 50.0x over baseline
 
-### UNROLL=16
-- **Approach**: Process 128 elements per batch instead of 64
-- **Result**: Requires complete rewrite of normal round pipelining
-- **Issue**: Hash time scales sub-linearly but complexity explodes
+## Bundle Analysis (2973 cycles)
+- VALU-only: 1458 cycles (49.0%)
+- Load-only: ~600 cycles (20.2%)
+- 0 VALU slots: 653 cycles (22.0%)
+- 2 VALU slots: 689 cycles (23.2%) - main inefficiency
+- 6 VALU slots: 1264 cycles (42.5%) - full utilization
 
-## Bottleneck Analysis
+## VALU Efficiency Analysis
+- Total VALU ops: 9884
+- Maximum capacity: 17838 (2973 cycles × 6 slots)
+- VALU efficiency: 55.4%
+- The 689 2-slot cycles are from v0-v1 hash/index while loading v2-v7
 
-### Load Bottleneck (Normal Rounds)
-- 64 indirect loads per batch-round = 32 cycles (at 2 loads/cycle)
-- 48 normal batch-rounds × 32 = 1,536 cycles (already > 1,400 target)
+## Remaining Challenges
+1. 2-slot VALU inefficiency: 689 cycles use only 2 slots (data dependency limited)
+2. Load-only cycles: Can't overlap with VALU due to data dependencies
+3. Special rounds (level 0-2) have VALU-only work with idle Load/ALU
 
-### Hash Bottleneck
-- 6 stages × 5 cycles = 30 cycles per batch-round
-- 64 batch-rounds × 30 = 1,920 cycles (but can overlap with loads)
+## Theoretical Minimum Analysis (Detailed)
+- VALU ops per element: 18 (1 XOR + 12 hash + 5 index)
+- Level 2 extra ops: 9 (arithmetic selection)
+- Total element-ops: 256 × (14 rounds × 18 + 2 rounds × 27) = 78,336
+- SIMD ops: 78,336 / 8 = 9,792
+- Minimum VALU cycles (at 6/cycle): ~1,632
+- Load cycles (10 normal rounds × 4 sub-batches × 32 = 1,280): ~1,280
+- With perfect overlap: ~1,800 cycles theoretical minimum
+- **Target <1400 is BELOW theoretical minimum** - may need different algorithm
 
-### Fundamental Limit
-- The load bottleneck (2/cycle) fundamentally limits optimization potential
-- To reach 1,400 cycles, must dramatically reduce total loads
-- Tree-level caching only helps for low levels (0, 1, maybe 2)
-
-## Architecture Notes
-- VALU: 6 slots/cycle, supports +, -, *, //, ^, &, |, <<, >>, <, ==
-- No >= operator (must use: a >= b ≡ NOT(a < b) ≡ 1 - (a < b))
-- Load: 2 slots/cycle
-- Flow: 1 slot/cycle (vselect bottleneck)
-- Scratch: 1,536 words
+## Key Insight
+The 1400 cycle target appears to be below the theoretical VALU minimum of ~1630 cycles.
+This suggests either:
+1. A different algorithmic approach is needed (not just pipelining)
+2. Mathematical simplifications to reduce VALU operations
+3. The target is extremely aggressive/aspirational
