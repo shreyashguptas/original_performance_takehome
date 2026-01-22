@@ -167,6 +167,7 @@ class KernelBuilder:
         self.add("valu", ("vbroadcast", v_two, two_const))
         self.add("valu", ("vbroadcast", v_three, three_const))
         self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
+        # v_seven will be broadcast after allocation below
 
         # Shared node value for rounds where all indices = 0
         shared_node_val = self.alloc_scratch("shared_node_val")
@@ -182,10 +183,28 @@ class KernelBuilder:
         level2_vals = [self.alloc_scratch(f"level2_val{i}") for i in range(4)]
         v_level2 = [self.alloc_scratch(f"v_level2_{i}", VLEN) for i in range(4)]
 
-        # Pre-compute addresses for level 1 and 2 tree values
+        # Level 3 tree values (indices 7-14)
+        level3_vals = [self.alloc_scratch(f"level3_val{i}") for i in range(8)]
+        v_level3 = [self.alloc_scratch(f"v_level3_{i}", VLEN) for i in range(8)]
+
+        # Pre-compute addresses for level 1, 2, and 3 tree values
         addr_level1_0 = self.alloc_scratch("addr_level1_0")
         addr_level1_1 = self.alloc_scratch("addr_level1_1")
         addr_level2 = [self.alloc_scratch(f"addr_level2_{i}") for i in range(4)]
+        addr_level3 = [self.alloc_scratch(f"addr_level3_{i}") for i in range(8)]
+
+        # Constants for level 3 (7-14)
+        seven_const = self.scratch_const(7)
+        v_seven = self.alloc_scratch("v_seven", VLEN)
+        self.add("valu", ("vbroadcast", v_seven, seven_const))
+
+        # Additional constants for level 3 arithmetic selection (need 0-7)
+        v_four = self.alloc_scratch("v_four", VLEN)
+        v_five = self.alloc_scratch("v_five", VLEN)
+        v_six = self.alloc_scratch("v_six", VLEN)
+        self.add("valu", ("vbroadcast", v_four, four_const))
+        self.add("valu", ("vbroadcast", v_five, five_const))
+        self.add("valu", ("vbroadcast", v_six, six_const))
 
         self.add("flow", ("pause",))
         self.add("debug", ("comment", "Starting optimized VLIW SIMD loop"))
@@ -196,6 +215,11 @@ class KernelBuilder:
             base_offset = batch * UNROLL * VLEN
 
             for rnd in range(rounds):
+                # Determine tree level
+                if rnd <= 10:
+                    tree_level = rnd
+                else:
+                    tree_level = rnd - 11  # After wrap
                 # ============================================================
                 # PHASE 1: Setup address bases and load v_idx, v_hash (round 0 only)
                 # ============================================================
@@ -219,21 +243,10 @@ class KernelBuilder:
                         ])
 
                 # ============================================================
-                # PHASE 2 & 3: Tree value loading
-                # Optimizations:
-                # - Level 0 (rounds 0, 11): 1 load + broadcast
-                # - Level 1 (rounds 1, 12): 2 loads + vselect
-                # - Higher levels: indirect loads
+                # PHASE 2 & 3: Tree value loading and operations
                 # ============================================================
-                # Determine tree level
-                if rnd <= 10:
-                    tree_level = rnd
-                else:
-                    tree_level = rnd - 11  # After wrap
-
                 if tree_level == 0:
                     # Level 0: All elements access forest_values[0]
-                    # 1 load + broadcast = 2 cycles instead of 40 cycles!
                     self.add("load", ("load", shared_node_val, self.scratch["forest_values_p"]))
                     self.add("valu", ("vbroadcast", v_shared_node, shared_node_val))
 
@@ -264,8 +277,6 @@ class KernelBuilder:
 
                 elif tree_level == 1:
                     # Level 1: Indices are 1 or 2
-                    # 2 loads + vselect instead of 64 indirect loads
-                    # Load forest_values[1] and forest_values[2]
                     self.add_vliw([
                         ("alu", ("+", addr_level1_0, self.scratch["forest_values_p"], one_const)),
                         ("alu", ("+", addr_level1_1, self.scratch["forest_values_p"], two_const)),
@@ -317,19 +328,265 @@ class KernelBuilder:
                                 slots.append(("valu", (op2, v_hash[k], v_tmp1[k], v_tmp2[k])))
                             self.add_vliw(slots)
 
+                elif tree_level == 2:
+                    # Level 2: Indices are 3, 4, 5, 6
+                    # Use arithmetic selection
+                    self.add_vliw([
+                        ("alu", ("+", addr_level2[0], self.scratch["forest_values_p"], three_const)),
+                        ("alu", ("+", addr_level2[1], self.scratch["forest_values_p"], four_const)),
+                        ("alu", ("+", addr_level2[2], self.scratch["forest_values_p"], five_const)),
+                        ("alu", ("+", addr_level2[3], self.scratch["forest_values_p"], six_const)),
+                    ])
+                    self.add_vliw([
+                        ("load", ("load", level2_vals[0], addr_level2[0])),
+                        ("load", ("load", level2_vals[1], addr_level2[1])),
+                    ])
+                    self.add_vliw([
+                        ("load", ("load", level2_vals[2], addr_level2[2])),
+                        ("load", ("load", level2_vals[3], addr_level2[3])),
+                    ])
+                    self.add_vliw([
+                        ("valu", ("vbroadcast", v_level2[0], level2_vals[0])),
+                        ("valu", ("vbroadcast", v_level2[1], level2_vals[1])),
+                        ("valu", ("vbroadcast", v_level2[2], level2_vals[2])),
+                        ("valu", ("vbroadcast", v_level2[3], level2_vals[3])),
+                    ])
+
+                    # Compute offset = idx - 3 for all vectors (6 per cycle)
+                    self.add_vliw([
+                        ("valu", ("-", v_cond[0], v_idx[0], v_three)),
+                        ("valu", ("-", v_cond[1], v_idx[1], v_three)),
+                        ("valu", ("-", v_cond[2], v_idx[2], v_three)),
+                        ("valu", ("-", v_cond[3], v_idx[3], v_three)),
+                        ("valu", ("-", v_cond[4], v_idx[4], v_three)),
+                        ("valu", ("-", v_cond[5], v_idx[5], v_three)),
+                    ])
+                    self.add_vliw([
+                        ("valu", ("-", v_cond[6], v_idx[6], v_three)),
+                        ("valu", ("-", v_cond[7], v_idx[7], v_three)),
+                    ])
+
+                    # eq0 = (offset == 0) for all vectors
+                    self.add_vliw([
+                        ("valu", ("==", v_tmp1[0], v_cond[0], v_zero)),
+                        ("valu", ("==", v_tmp1[1], v_cond[1], v_zero)),
+                        ("valu", ("==", v_tmp1[2], v_cond[2], v_zero)),
+                        ("valu", ("==", v_tmp1[3], v_cond[3], v_zero)),
+                        ("valu", ("==", v_tmp1[4], v_cond[4], v_zero)),
+                        ("valu", ("==", v_tmp1[5], v_cond[5], v_zero)),
+                    ])
+                    self.add_vliw([
+                        ("valu", ("==", v_tmp1[6], v_cond[6], v_zero)),
+                        ("valu", ("==", v_tmp1[7], v_cond[7], v_zero)),
+                    ])
+
+                    # t0 = val0 * eq0 for all vectors
+                    self.add_vliw([
+                        ("valu", ("*", v_tmp2[0], v_level2[0], v_tmp1[0])),
+                        ("valu", ("*", v_tmp2[1], v_level2[0], v_tmp1[1])),
+                        ("valu", ("*", v_tmp2[2], v_level2[0], v_tmp1[2])),
+                        ("valu", ("*", v_tmp2[3], v_level2[0], v_tmp1[3])),
+                        ("valu", ("*", v_tmp2[4], v_level2[0], v_tmp1[4])),
+                        ("valu", ("*", v_tmp2[5], v_level2[0], v_tmp1[5])),
+                    ])
+                    self.add_vliw([
+                        ("valu", ("*", v_tmp2[6], v_level2[0], v_tmp1[6])),
+                        ("valu", ("*", v_tmp2[7], v_level2[0], v_tmp1[7])),
+                    ])
+
+                    # eq1 = (offset == 1) for all vectors
+                    self.add_vliw([
+                        ("valu", ("==", v_tmp1[0], v_cond[0], v_one)),
+                        ("valu", ("==", v_tmp1[1], v_cond[1], v_one)),
+                        ("valu", ("==", v_tmp1[2], v_cond[2], v_one)),
+                        ("valu", ("==", v_tmp1[3], v_cond[3], v_one)),
+                        ("valu", ("==", v_tmp1[4], v_cond[4], v_one)),
+                        ("valu", ("==", v_tmp1[5], v_cond[5], v_one)),
+                    ])
+                    self.add_vliw([
+                        ("valu", ("==", v_tmp1[6], v_cond[6], v_one)),
+                        ("valu", ("==", v_tmp1[7], v_cond[7], v_one)),
+                    ])
+
+                    # t1 = val1 * eq1 + t0 for all vectors
+                    self.add_vliw([
+                        ("valu", ("multiply_add", v_tmp2[0], v_level2[1], v_tmp1[0], v_tmp2[0])),
+                        ("valu", ("multiply_add", v_tmp2[1], v_level2[1], v_tmp1[1], v_tmp2[1])),
+                        ("valu", ("multiply_add", v_tmp2[2], v_level2[1], v_tmp1[2], v_tmp2[2])),
+                        ("valu", ("multiply_add", v_tmp2[3], v_level2[1], v_tmp1[3], v_tmp2[3])),
+                        ("valu", ("multiply_add", v_tmp2[4], v_level2[1], v_tmp1[4], v_tmp2[4])),
+                        ("valu", ("multiply_add", v_tmp2[5], v_level2[1], v_tmp1[5], v_tmp2[5])),
+                    ])
+                    self.add_vliw([
+                        ("valu", ("multiply_add", v_tmp2[6], v_level2[1], v_tmp1[6], v_tmp2[6])),
+                        ("valu", ("multiply_add", v_tmp2[7], v_level2[1], v_tmp1[7], v_tmp2[7])),
+                    ])
+
+                    # eq2 = (offset == 2) for all vectors
+                    self.add_vliw([
+                        ("valu", ("==", v_tmp1[0], v_cond[0], v_two)),
+                        ("valu", ("==", v_tmp1[1], v_cond[1], v_two)),
+                        ("valu", ("==", v_tmp1[2], v_cond[2], v_two)),
+                        ("valu", ("==", v_tmp1[3], v_cond[3], v_two)),
+                        ("valu", ("==", v_tmp1[4], v_cond[4], v_two)),
+                        ("valu", ("==", v_tmp1[5], v_cond[5], v_two)),
+                    ])
+                    self.add_vliw([
+                        ("valu", ("==", v_tmp1[6], v_cond[6], v_two)),
+                        ("valu", ("==", v_tmp1[7], v_cond[7], v_two)),
+                    ])
+
+                    # t2 = val2 * eq2 + t1 for all vectors
+                    self.add_vliw([
+                        ("valu", ("multiply_add", v_tmp2[0], v_level2[2], v_tmp1[0], v_tmp2[0])),
+                        ("valu", ("multiply_add", v_tmp2[1], v_level2[2], v_tmp1[1], v_tmp2[1])),
+                        ("valu", ("multiply_add", v_tmp2[2], v_level2[2], v_tmp1[2], v_tmp2[2])),
+                        ("valu", ("multiply_add", v_tmp2[3], v_level2[2], v_tmp1[3], v_tmp2[3])),
+                        ("valu", ("multiply_add", v_tmp2[4], v_level2[2], v_tmp1[4], v_tmp2[4])),
+                        ("valu", ("multiply_add", v_tmp2[5], v_level2[2], v_tmp1[5], v_tmp2[5])),
+                    ])
+                    self.add_vliw([
+                        ("valu", ("multiply_add", v_tmp2[6], v_level2[2], v_tmp1[6], v_tmp2[6])),
+                        ("valu", ("multiply_add", v_tmp2[7], v_level2[2], v_tmp1[7], v_tmp2[7])),
+                    ])
+
+                    # eq3 = (offset == 3) for all vectors
+                    self.add_vliw([
+                        ("valu", ("==", v_tmp1[0], v_cond[0], v_three)),
+                        ("valu", ("==", v_tmp1[1], v_cond[1], v_three)),
+                        ("valu", ("==", v_tmp1[2], v_cond[2], v_three)),
+                        ("valu", ("==", v_tmp1[3], v_cond[3], v_three)),
+                        ("valu", ("==", v_tmp1[4], v_cond[4], v_three)),
+                        ("valu", ("==", v_tmp1[5], v_cond[5], v_three)),
+                    ])
+                    self.add_vliw([
+                        ("valu", ("==", v_tmp1[6], v_cond[6], v_three)),
+                        ("valu", ("==", v_tmp1[7], v_cond[7], v_three)),
+                    ])
+
+                    # result = val3 * eq3 + t2 for all vectors
+                    self.add_vliw([
+                        ("valu", ("multiply_add", v_node_val[0], v_level2[3], v_tmp1[0], v_tmp2[0])),
+                        ("valu", ("multiply_add", v_node_val[1], v_level2[3], v_tmp1[1], v_tmp2[1])),
+                        ("valu", ("multiply_add", v_node_val[2], v_level2[3], v_tmp1[2], v_tmp2[2])),
+                        ("valu", ("multiply_add", v_node_val[3], v_level2[3], v_tmp1[3], v_tmp2[3])),
+                        ("valu", ("multiply_add", v_node_val[4], v_level2[3], v_tmp1[4], v_tmp2[4])),
+                        ("valu", ("multiply_add", v_node_val[5], v_level2[3], v_tmp1[5], v_tmp2[5])),
+                    ])
+                    self.add_vliw([
+                        ("valu", ("multiply_add", v_node_val[6], v_level2[3], v_tmp1[6], v_tmp2[6])),
+                        ("valu", ("multiply_add", v_node_val[7], v_level2[3], v_tmp1[7], v_tmp2[7])),
+                    ])
+
+                    # XOR with hash (6 per cycle)
+                    self.add_vliw([
+                        ("valu", ("^", v_hash[0], v_hash[0], v_node_val[0])),
+                        ("valu", ("^", v_hash[1], v_hash[1], v_node_val[1])),
+                        ("valu", ("^", v_hash[2], v_hash[2], v_node_val[2])),
+                        ("valu", ("^", v_hash[3], v_hash[3], v_node_val[3])),
+                        ("valu", ("^", v_hash[4], v_hash[4], v_node_val[4])),
+                        ("valu", ("^", v_hash[5], v_hash[5], v_node_val[5])),
+                    ])
+                    self.add_vliw([
+                        ("valu", ("^", v_hash[6], v_hash[6], v_node_val[6])),
+                        ("valu", ("^", v_hash[7], v_hash[7], v_node_val[7])),
+                    ])
+
+                    # Hash all UNROLL vectors
+                    for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                        for j in range(0, UNROLL, 3):
+                            end = min(j + 3, UNROLL)
+                            slots = []
+                            for k in range(j, end):
+                                slots.append(("valu", (op1, v_tmp1[k], v_hash[k], v_hash_const1[hi])))
+                                slots.append(("valu", (op3, v_tmp2[k], v_hash[k], v_hash_const3[hi])))
+                            self.add_vliw(slots)
+                        for j in range(0, UNROLL, 6):
+                            end = min(j + 6, UNROLL)
+                            slots = []
+                            for k in range(j, end):
+                                slots.append(("valu", (op2, v_hash[k], v_tmp1[k], v_tmp2[k])))
+                            self.add_vliw(slots)
+
                 else:
-                    # Normal round: compute addresses and do indirect loads
-                    for j in range(0, UNROLL, 1):
-                        self.add_vliw([
-                            ("alu", ("+", s_addr[j][0], self.scratch["forest_values_p"], v_idx[j] + 0)),
-                            ("alu", ("+", s_addr[j][1], self.scratch["forest_values_p"], v_idx[j] + 1)),
-                            ("alu", ("+", s_addr[j][2], self.scratch["forest_values_p"], v_idx[j] + 2)),
-                            ("alu", ("+", s_addr[j][3], self.scratch["forest_values_p"], v_idx[j] + 3)),
-                            ("alu", ("+", s_addr[j][4], self.scratch["forest_values_p"], v_idx[j] + 4)),
-                            ("alu", ("+", s_addr[j][5], self.scratch["forest_values_p"], v_idx[j] + 5)),
-                            ("alu", ("+", s_addr[j][6], self.scratch["forest_values_p"], v_idx[j] + 6)),
-                            ("alu", ("+", s_addr[j][7], self.scratch["forest_values_p"], v_idx[j] + 7)),
-                        ])
+                    # Normal round: compute addresses using all 12 ALU slots for faster calc
+                    # Pack addresses for multiple vectors per cycle
+                    self.add_vliw([
+                        ("alu", ("+", s_addr[0][0], self.scratch["forest_values_p"], v_idx[0] + 0)),
+                        ("alu", ("+", s_addr[0][1], self.scratch["forest_values_p"], v_idx[0] + 1)),
+                        ("alu", ("+", s_addr[0][2], self.scratch["forest_values_p"], v_idx[0] + 2)),
+                        ("alu", ("+", s_addr[0][3], self.scratch["forest_values_p"], v_idx[0] + 3)),
+                        ("alu", ("+", s_addr[0][4], self.scratch["forest_values_p"], v_idx[0] + 4)),
+                        ("alu", ("+", s_addr[0][5], self.scratch["forest_values_p"], v_idx[0] + 5)),
+                        ("alu", ("+", s_addr[0][6], self.scratch["forest_values_p"], v_idx[0] + 6)),
+                        ("alu", ("+", s_addr[0][7], self.scratch["forest_values_p"], v_idx[0] + 7)),
+                        ("alu", ("+", s_addr[1][0], self.scratch["forest_values_p"], v_idx[1] + 0)),
+                        ("alu", ("+", s_addr[1][1], self.scratch["forest_values_p"], v_idx[1] + 1)),
+                        ("alu", ("+", s_addr[1][2], self.scratch["forest_values_p"], v_idx[1] + 2)),
+                        ("alu", ("+", s_addr[1][3], self.scratch["forest_values_p"], v_idx[1] + 3)),
+                    ])
+                    self.add_vliw([
+                        ("alu", ("+", s_addr[1][4], self.scratch["forest_values_p"], v_idx[1] + 4)),
+                        ("alu", ("+", s_addr[1][5], self.scratch["forest_values_p"], v_idx[1] + 5)),
+                        ("alu", ("+", s_addr[1][6], self.scratch["forest_values_p"], v_idx[1] + 6)),
+                        ("alu", ("+", s_addr[1][7], self.scratch["forest_values_p"], v_idx[1] + 7)),
+                        ("alu", ("+", s_addr[2][0], self.scratch["forest_values_p"], v_idx[2] + 0)),
+                        ("alu", ("+", s_addr[2][1], self.scratch["forest_values_p"], v_idx[2] + 1)),
+                        ("alu", ("+", s_addr[2][2], self.scratch["forest_values_p"], v_idx[2] + 2)),
+                        ("alu", ("+", s_addr[2][3], self.scratch["forest_values_p"], v_idx[2] + 3)),
+                        ("alu", ("+", s_addr[2][4], self.scratch["forest_values_p"], v_idx[2] + 4)),
+                        ("alu", ("+", s_addr[2][5], self.scratch["forest_values_p"], v_idx[2] + 5)),
+                        ("alu", ("+", s_addr[2][6], self.scratch["forest_values_p"], v_idx[2] + 6)),
+                        ("alu", ("+", s_addr[2][7], self.scratch["forest_values_p"], v_idx[2] + 7)),
+                    ])
+                    self.add_vliw([
+                        ("alu", ("+", s_addr[3][0], self.scratch["forest_values_p"], v_idx[3] + 0)),
+                        ("alu", ("+", s_addr[3][1], self.scratch["forest_values_p"], v_idx[3] + 1)),
+                        ("alu", ("+", s_addr[3][2], self.scratch["forest_values_p"], v_idx[3] + 2)),
+                        ("alu", ("+", s_addr[3][3], self.scratch["forest_values_p"], v_idx[3] + 3)),
+                        ("alu", ("+", s_addr[3][4], self.scratch["forest_values_p"], v_idx[3] + 4)),
+                        ("alu", ("+", s_addr[3][5], self.scratch["forest_values_p"], v_idx[3] + 5)),
+                        ("alu", ("+", s_addr[3][6], self.scratch["forest_values_p"], v_idx[3] + 6)),
+                        ("alu", ("+", s_addr[3][7], self.scratch["forest_values_p"], v_idx[3] + 7)),
+                        ("alu", ("+", s_addr[4][0], self.scratch["forest_values_p"], v_idx[4] + 0)),
+                        ("alu", ("+", s_addr[4][1], self.scratch["forest_values_p"], v_idx[4] + 1)),
+                        ("alu", ("+", s_addr[4][2], self.scratch["forest_values_p"], v_idx[4] + 2)),
+                        ("alu", ("+", s_addr[4][3], self.scratch["forest_values_p"], v_idx[4] + 3)),
+                    ])
+                    self.add_vliw([
+                        ("alu", ("+", s_addr[4][4], self.scratch["forest_values_p"], v_idx[4] + 4)),
+                        ("alu", ("+", s_addr[4][5], self.scratch["forest_values_p"], v_idx[4] + 5)),
+                        ("alu", ("+", s_addr[4][6], self.scratch["forest_values_p"], v_idx[4] + 6)),
+                        ("alu", ("+", s_addr[4][7], self.scratch["forest_values_p"], v_idx[4] + 7)),
+                        ("alu", ("+", s_addr[5][0], self.scratch["forest_values_p"], v_idx[5] + 0)),
+                        ("alu", ("+", s_addr[5][1], self.scratch["forest_values_p"], v_idx[5] + 1)),
+                        ("alu", ("+", s_addr[5][2], self.scratch["forest_values_p"], v_idx[5] + 2)),
+                        ("alu", ("+", s_addr[5][3], self.scratch["forest_values_p"], v_idx[5] + 3)),
+                        ("alu", ("+", s_addr[5][4], self.scratch["forest_values_p"], v_idx[5] + 4)),
+                        ("alu", ("+", s_addr[5][5], self.scratch["forest_values_p"], v_idx[5] + 5)),
+                        ("alu", ("+", s_addr[5][6], self.scratch["forest_values_p"], v_idx[5] + 6)),
+                        ("alu", ("+", s_addr[5][7], self.scratch["forest_values_p"], v_idx[5] + 7)),
+                    ])
+                    self.add_vliw([
+                        ("alu", ("+", s_addr[6][0], self.scratch["forest_values_p"], v_idx[6] + 0)),
+                        ("alu", ("+", s_addr[6][1], self.scratch["forest_values_p"], v_idx[6] + 1)),
+                        ("alu", ("+", s_addr[6][2], self.scratch["forest_values_p"], v_idx[6] + 2)),
+                        ("alu", ("+", s_addr[6][3], self.scratch["forest_values_p"], v_idx[6] + 3)),
+                        ("alu", ("+", s_addr[6][4], self.scratch["forest_values_p"], v_idx[6] + 4)),
+                        ("alu", ("+", s_addr[6][5], self.scratch["forest_values_p"], v_idx[6] + 5)),
+                        ("alu", ("+", s_addr[6][6], self.scratch["forest_values_p"], v_idx[6] + 6)),
+                        ("alu", ("+", s_addr[6][7], self.scratch["forest_values_p"], v_idx[6] + 7)),
+                        ("alu", ("+", s_addr[7][0], self.scratch["forest_values_p"], v_idx[7] + 0)),
+                        ("alu", ("+", s_addr[7][1], self.scratch["forest_values_p"], v_idx[7] + 1)),
+                        ("alu", ("+", s_addr[7][2], self.scratch["forest_values_p"], v_idx[7] + 2)),
+                        ("alu", ("+", s_addr[7][3], self.scratch["forest_values_p"], v_idx[7] + 3)),
+                    ])
+                    self.add_vliw([
+                        ("alu", ("+", s_addr[7][4], self.scratch["forest_values_p"], v_idx[7] + 4)),
+                        ("alu", ("+", s_addr[7][5], self.scratch["forest_values_p"], v_idx[7] + 5)),
+                        ("alu", ("+", s_addr[7][6], self.scratch["forest_values_p"], v_idx[7] + 6)),
+                        ("alu", ("+", s_addr[7][7], self.scratch["forest_values_p"], v_idx[7] + 7)),
+                    ])
 
                     # Load v0 and v1 node values (8 cycles)
                     for k in range(0, VLEN, 2):
@@ -513,9 +770,9 @@ class KernelBuilder:
                         ])
 
                 # ============================================================
-                # PHASE 4: Index calculation (for level 0 and 1 paths)
+                # PHASE 4: Index calculation (for level 0, 1, and 2 paths)
                 # ============================================================
-                if tree_level <= 1:
+                if tree_level <= 2:
                     # For level 0 and 1 rounds, do all index calculations here
                     for j in range(0, UNROLL, 2):
                         self.add_vliw([
