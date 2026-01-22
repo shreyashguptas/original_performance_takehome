@@ -138,6 +138,10 @@ class KernelBuilder:
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
+        three_const = self.scratch_const(3)
+        four_const = self.scratch_const(4)
+        five_const = self.scratch_const(5)
+        six_const = self.scratch_const(6)
 
         # Pre-broadcast hash constants to vectors
         v_hash_const1 = []
@@ -156,10 +160,12 @@ class KernelBuilder:
         v_zero = self.alloc_scratch("v_zero", VLEN)
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
+        v_three = self.alloc_scratch("v_three", VLEN)
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
         self.add("valu", ("vbroadcast", v_zero, zero_const))
         self.add("valu", ("vbroadcast", v_one, one_const))
         self.add("valu", ("vbroadcast", v_two, two_const))
+        self.add("valu", ("vbroadcast", v_three, three_const))
         self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
 
         # Shared node value for rounds where all indices = 0
@@ -238,42 +244,23 @@ class KernelBuilder:
                             ("valu", ("^", v_hash[j+1], v_hash[j+1], v_shared_node)),
                         ])
 
-                    # Hash all 8 vectors (no interleaved loads needed)
+                    # Hash all UNROLL vectors (no interleaved loads needed)
                     for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                        self.add_vliw([
-                            ("valu", (op1, v_tmp1[0], v_hash[0], v_hash_const1[hi])),
-                            ("valu", (op3, v_tmp2[0], v_hash[0], v_hash_const3[hi])),
-                            ("valu", (op1, v_tmp1[1], v_hash[1], v_hash_const1[hi])),
-                            ("valu", (op3, v_tmp2[1], v_hash[1], v_hash_const3[hi])),
-                            ("valu", (op1, v_tmp1[2], v_hash[2], v_hash_const1[hi])),
-                            ("valu", (op3, v_tmp2[2], v_hash[2], v_hash_const3[hi])),
-                        ])
-                        self.add_vliw([
-                            ("valu", (op1, v_tmp1[3], v_hash[3], v_hash_const1[hi])),
-                            ("valu", (op3, v_tmp2[3], v_hash[3], v_hash_const3[hi])),
-                            ("valu", (op1, v_tmp1[4], v_hash[4], v_hash_const1[hi])),
-                            ("valu", (op3, v_tmp2[4], v_hash[4], v_hash_const3[hi])),
-                            ("valu", (op1, v_tmp1[5], v_hash[5], v_hash_const1[hi])),
-                            ("valu", (op3, v_tmp2[5], v_hash[5], v_hash_const3[hi])),
-                        ])
-                        self.add_vliw([
-                            ("valu", (op1, v_tmp1[6], v_hash[6], v_hash_const1[hi])),
-                            ("valu", (op3, v_tmp2[6], v_hash[6], v_hash_const3[hi])),
-                            ("valu", (op1, v_tmp1[7], v_hash[7], v_hash_const1[hi])),
-                            ("valu", (op3, v_tmp2[7], v_hash[7], v_hash_const3[hi])),
-                        ])
-                        self.add_vliw([
-                            ("valu", (op2, v_hash[0], v_tmp1[0], v_tmp2[0])),
-                            ("valu", (op2, v_hash[1], v_tmp1[1], v_tmp2[1])),
-                            ("valu", (op2, v_hash[2], v_tmp1[2], v_tmp2[2])),
-                            ("valu", (op2, v_hash[3], v_tmp1[3], v_tmp2[3])),
-                            ("valu", (op2, v_hash[4], v_tmp1[4], v_tmp2[4])),
-                            ("valu", (op2, v_hash[5], v_tmp1[5], v_tmp2[5])),
-                        ])
-                        self.add_vliw([
-                            ("valu", (op2, v_hash[6], v_tmp1[6], v_tmp2[6])),
-                            ("valu", (op2, v_hash[7], v_tmp1[7], v_tmp2[7])),
-                        ])
+                        # op1 and op3 for all vectors (3 vectors per cycle, 6 ops)
+                        for j in range(0, UNROLL, 3):
+                            end = min(j + 3, UNROLL)
+                            slots = []
+                            for k in range(j, end):
+                                slots.append(("valu", (op1, v_tmp1[k], v_hash[k], v_hash_const1[hi])))
+                                slots.append(("valu", (op3, v_tmp2[k], v_hash[k], v_hash_const3[hi])))
+                            self.add_vliw(slots)
+                        # op2 for all vectors (6 vectors per cycle)
+                        for j in range(0, UNROLL, 6):
+                            end = min(j + 6, UNROLL)
+                            slots = []
+                            for k in range(j, end):
+                                slots.append(("valu", (op2, v_hash[k], v_tmp1[k], v_tmp2[k])))
+                            self.add_vliw(slots)
 
                 elif tree_level == 1:
                     # Level 1: Indices are 1 or 2
@@ -312,42 +299,23 @@ class KernelBuilder:
                             ("valu", ("^", v_hash[j+1], v_hash[j+1], v_node_val[j+1])),
                         ])
 
-                    # Hash all 8 vectors
+                    # Hash all UNROLL vectors
                     for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                        self.add_vliw([
-                            ("valu", (op1, v_tmp1[0], v_hash[0], v_hash_const1[hi])),
-                            ("valu", (op3, v_tmp2[0], v_hash[0], v_hash_const3[hi])),
-                            ("valu", (op1, v_tmp1[1], v_hash[1], v_hash_const1[hi])),
-                            ("valu", (op3, v_tmp2[1], v_hash[1], v_hash_const3[hi])),
-                            ("valu", (op1, v_tmp1[2], v_hash[2], v_hash_const1[hi])),
-                            ("valu", (op3, v_tmp2[2], v_hash[2], v_hash_const3[hi])),
-                        ])
-                        self.add_vliw([
-                            ("valu", (op1, v_tmp1[3], v_hash[3], v_hash_const1[hi])),
-                            ("valu", (op3, v_tmp2[3], v_hash[3], v_hash_const3[hi])),
-                            ("valu", (op1, v_tmp1[4], v_hash[4], v_hash_const1[hi])),
-                            ("valu", (op3, v_tmp2[4], v_hash[4], v_hash_const3[hi])),
-                            ("valu", (op1, v_tmp1[5], v_hash[5], v_hash_const1[hi])),
-                            ("valu", (op3, v_tmp2[5], v_hash[5], v_hash_const3[hi])),
-                        ])
-                        self.add_vliw([
-                            ("valu", (op1, v_tmp1[6], v_hash[6], v_hash_const1[hi])),
-                            ("valu", (op3, v_tmp2[6], v_hash[6], v_hash_const3[hi])),
-                            ("valu", (op1, v_tmp1[7], v_hash[7], v_hash_const1[hi])),
-                            ("valu", (op3, v_tmp2[7], v_hash[7], v_hash_const3[hi])),
-                        ])
-                        self.add_vliw([
-                            ("valu", (op2, v_hash[0], v_tmp1[0], v_tmp2[0])),
-                            ("valu", (op2, v_hash[1], v_tmp1[1], v_tmp2[1])),
-                            ("valu", (op2, v_hash[2], v_tmp1[2], v_tmp2[2])),
-                            ("valu", (op2, v_hash[3], v_tmp1[3], v_tmp2[3])),
-                            ("valu", (op2, v_hash[4], v_tmp1[4], v_tmp2[4])),
-                            ("valu", (op2, v_hash[5], v_tmp1[5], v_tmp2[5])),
-                        ])
-                        self.add_vliw([
-                            ("valu", (op2, v_hash[6], v_tmp1[6], v_tmp2[6])),
-                            ("valu", (op2, v_hash[7], v_tmp1[7], v_tmp2[7])),
-                        ])
+                        # op1 and op3 for all vectors (3 vectors per cycle, 6 ops)
+                        for j in range(0, UNROLL, 3):
+                            end = min(j + 3, UNROLL)
+                            slots = []
+                            for k in range(j, end):
+                                slots.append(("valu", (op1, v_tmp1[k], v_hash[k], v_hash_const1[hi])))
+                                slots.append(("valu", (op3, v_tmp2[k], v_hash[k], v_hash_const3[hi])))
+                            self.add_vliw(slots)
+                        # op2 for all vectors (6 vectors per cycle)
+                        for j in range(0, UNROLL, 6):
+                            end = min(j + 6, UNROLL)
+                            slots = []
+                            for k in range(j, end):
+                                slots.append(("valu", (op2, v_hash[k], v_tmp1[k], v_tmp2[k])))
+                            self.add_vliw(slots)
 
                 else:
                     # Normal round: compute addresses and do indirect loads
