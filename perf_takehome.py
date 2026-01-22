@@ -427,6 +427,9 @@ class KernelBuilder:
             # Flag for whether THIS round should benefit from pre-pipelining
             this_round_prepipelined = next_round_prepipelined
             next_round_prepipelined = False  # Reset for next iteration
+            # Last round doesn't need index calculation (no subsequent round uses indices)
+            is_last_round = (rnd == rounds - 1)
+
 
             if tree_level == 0:
                 # Level 0: All elements access forest_values[0]
@@ -1214,35 +1217,46 @@ class KernelBuilder:
                         if slots:
                             self.add_vliw(slots)
 
-                    # Hash v2-v7 stage 0 with multiply_add + overlapped v0-v1 index calc
-                    # Stage 0 uses + combiner, so use multiply_add (2 cycles for 6 vectors)
-                    # Plus 5 sequential steps for v0-v1 index calc
-                    self.add_vliw([
-                        ("valu", ("multiply_add", v_hash[b][2], v_hash[b][2], v_hash_mult[0], v_hash_const1[0])),
-                        ("valu", ("multiply_add", v_hash[b][3], v_hash[b][3], v_hash_mult[0], v_hash_const1[0])),
-                        ("valu", ("multiply_add", v_hash[b][4], v_hash[b][4], v_hash_mult[0], v_hash_const1[0])),
-                        ("valu", ("multiply_add", v_hash[b][5], v_hash[b][5], v_hash_mult[0], v_hash_const1[0])),
-                        ("valu", ("&", v_cond[0], v_hash[b][0], v_one)),
-                        ("valu", ("&", v_cond[1], v_hash[b][1], v_one)),
-                    ])
-                    self.add_vliw([
-                        ("valu", ("multiply_add", v_hash[b][6], v_hash[b][6], v_hash_mult[0], v_hash_const1[0])),
-                        ("valu", ("multiply_add", v_hash[b][7], v_hash[b][7], v_hash_mult[0], v_hash_const1[0])),
-                        ("valu", ("+", v_cond[0], v_one, v_cond[0])),
-                        ("valu", ("+", v_cond[1], v_one, v_cond[1])),
-                    ])
-                    self.add_vliw([
-                        ("valu", ("multiply_add", v_idx[b][0], v_idx[b][0], v_two, v_cond[0])),
-                        ("valu", ("multiply_add", v_idx[b][1], v_idx[b][1], v_two, v_cond[1])),
-                    ])
-                    self.add_vliw([
-                        ("valu", ("<", v_cond[0], v_idx[b][0], v_n_nodes)),
-                        ("valu", ("<", v_cond[1], v_idx[b][1], v_n_nodes)),
-                    ])
-                    self.add_vliw([
-                        ("valu", ("*", v_idx[b][0], v_idx[b][0], v_cond[0])),
-                        ("valu", ("*", v_idx[b][1], v_idx[b][1], v_cond[1])),
-                    ])
+                    # Hash v2-v7 stage 0 with multiply_add + overlapped v0-v1 index calc (unless last round)
+                    # Stage 0 uses + combiner, so use multiply_add
+                    if is_last_round:
+                        # Last round: just hash stage 0 for v2-v7, no index calc
+                        self.add_vliw([
+                            ("valu", ("multiply_add", v_hash[b][2], v_hash[b][2], v_hash_mult[0], v_hash_const1[0])),
+                            ("valu", ("multiply_add", v_hash[b][3], v_hash[b][3], v_hash_mult[0], v_hash_const1[0])),
+                            ("valu", ("multiply_add", v_hash[b][4], v_hash[b][4], v_hash_mult[0], v_hash_const1[0])),
+                            ("valu", ("multiply_add", v_hash[b][5], v_hash[b][5], v_hash_mult[0], v_hash_const1[0])),
+                            ("valu", ("multiply_add", v_hash[b][6], v_hash[b][6], v_hash_mult[0], v_hash_const1[0])),
+                            ("valu", ("multiply_add", v_hash[b][7], v_hash[b][7], v_hash_mult[0], v_hash_const1[0])),
+                        ])
+                    else:
+                        # Hash stage 0 (2 cycles) + 5 sequential steps for v0-v1 index calc
+                        self.add_vliw([
+                            ("valu", ("multiply_add", v_hash[b][2], v_hash[b][2], v_hash_mult[0], v_hash_const1[0])),
+                            ("valu", ("multiply_add", v_hash[b][3], v_hash[b][3], v_hash_mult[0], v_hash_const1[0])),
+                            ("valu", ("multiply_add", v_hash[b][4], v_hash[b][4], v_hash_mult[0], v_hash_const1[0])),
+                            ("valu", ("multiply_add", v_hash[b][5], v_hash[b][5], v_hash_mult[0], v_hash_const1[0])),
+                            ("valu", ("&", v_cond[0], v_hash[b][0], v_one)),
+                            ("valu", ("&", v_cond[1], v_hash[b][1], v_one)),
+                        ])
+                        self.add_vliw([
+                            ("valu", ("multiply_add", v_hash[b][6], v_hash[b][6], v_hash_mult[0], v_hash_const1[0])),
+                            ("valu", ("multiply_add", v_hash[b][7], v_hash[b][7], v_hash_mult[0], v_hash_const1[0])),
+                            ("valu", ("+", v_cond[0], v_one, v_cond[0])),
+                            ("valu", ("+", v_cond[1], v_one, v_cond[1])),
+                        ])
+                        self.add_vliw([
+                            ("valu", ("multiply_add", v_idx[b][0], v_idx[b][0], v_two, v_cond[0])),
+                            ("valu", ("multiply_add", v_idx[b][1], v_idx[b][1], v_two, v_cond[1])),
+                        ])
+                        self.add_vliw([
+                            ("valu", ("<", v_cond[0], v_idx[b][0], v_n_nodes)),
+                            ("valu", ("<", v_cond[1], v_idx[b][1], v_n_nodes)),
+                        ])
+                        self.add_vliw([
+                            ("valu", ("*", v_idx[b][0], v_idx[b][0], v_cond[0])),
+                            ("valu", ("*", v_idx[b][1], v_idx[b][1], v_cond[1])),
+                        ])
 
                     # Hash stages 1-5 for v2-v7 with pipelined next sub-batch address calculation
                     # During these VALU-only cycles, overlap with ALU for next batch's addresses
@@ -1363,115 +1377,116 @@ class KernelBuilder:
                             self.add_vliw(slots3)
                             prev_alu_ops_done = alu_ops_done
 
-                    # Index calc for v2-v7, continue pipelining next batch during these VALU-only cycles
-                    slots_idx1 = [
-                        ("valu", ("&", v_cond[2], v_hash[b][2], v_one)),
-                        ("valu", ("&", v_cond[3], v_hash[b][3], v_one)),
-                        ("valu", ("&", v_cond[4], v_hash[b][4], v_one)),
-                        ("valu", ("&", v_cond[5], v_hash[b][5], v_one)),
-                        ("valu", ("&", v_cond[6], v_hash[b][6], v_one)),
-                        ("valu", ("&", v_cond[7], v_hash[b][7], v_one)),
-                    ]
-                    if next_b is not None:
-                        for _ in range(12):
-                            if alu_ops_done < 64:
-                                j, k = divmod(alu_ops_done, VLEN)
-                                slots_idx1.append(("alu", ("+", s_addr[j][k], self.scratch["forest_values_p"], v_idx[next_b][j] + k)))
-                                alu_ops_done += 1
-                        for _ in range(2):
-                            if load_done < 16 and prev_alu_ops_done >= (load_done // VLEN + 1) * VLEN:
-                                j, k = divmod(load_done, VLEN)
-                                slots_idx1.append(("load", ("load", v_node_val[j] + k, s_addr[j][k])))
-                                load_done += 1
-                    self.add_vliw(slots_idx1)
-                    prev_alu_ops_done = alu_ops_done
+                    # Index calc for v2-v7 (skip for last round), continue pipelining next batch
+                    if not is_last_round:
+                        slots_idx1 = [
+                            ("valu", ("&", v_cond[2], v_hash[b][2], v_one)),
+                            ("valu", ("&", v_cond[3], v_hash[b][3], v_one)),
+                            ("valu", ("&", v_cond[4], v_hash[b][4], v_one)),
+                            ("valu", ("&", v_cond[5], v_hash[b][5], v_one)),
+                            ("valu", ("&", v_cond[6], v_hash[b][6], v_one)),
+                            ("valu", ("&", v_cond[7], v_hash[b][7], v_one)),
+                        ]
+                        if next_b is not None:
+                            for _ in range(12):
+                                if alu_ops_done < 64:
+                                    j, k = divmod(alu_ops_done, VLEN)
+                                    slots_idx1.append(("alu", ("+", s_addr[j][k], self.scratch["forest_values_p"], v_idx[next_b][j] + k)))
+                                    alu_ops_done += 1
+                            for _ in range(2):
+                                if load_done < 16 and prev_alu_ops_done >= (load_done // VLEN + 1) * VLEN:
+                                    j, k = divmod(load_done, VLEN)
+                                    slots_idx1.append(("load", ("load", v_node_val[j] + k, s_addr[j][k])))
+                                    load_done += 1
+                        self.add_vliw(slots_idx1)
+                        prev_alu_ops_done = alu_ops_done
 
-                    slots_idx2 = [
-                        ("valu", ("+", v_cond[2], v_one, v_cond[2])),
-                        ("valu", ("+", v_cond[3], v_one, v_cond[3])),
-                        ("valu", ("+", v_cond[4], v_one, v_cond[4])),
-                        ("valu", ("+", v_cond[5], v_one, v_cond[5])),
-                        ("valu", ("+", v_cond[6], v_one, v_cond[6])),
-                        ("valu", ("+", v_cond[7], v_one, v_cond[7])),
-                    ]
-                    if next_b is not None:
-                        for _ in range(12):
-                            if alu_ops_done < 64:
-                                j, k = divmod(alu_ops_done, VLEN)
-                                slots_idx2.append(("alu", ("+", s_addr[j][k], self.scratch["forest_values_p"], v_idx[next_b][j] + k)))
-                                alu_ops_done += 1
-                        for _ in range(2):
-                            if load_done < 16 and prev_alu_ops_done >= (load_done // VLEN + 1) * VLEN:
-                                j, k = divmod(load_done, VLEN)
-                                slots_idx2.append(("load", ("load", v_node_val[j] + k, s_addr[j][k])))
-                                load_done += 1
-                    self.add_vliw(slots_idx2)
-                    prev_alu_ops_done = alu_ops_done
+                        slots_idx2 = [
+                            ("valu", ("+", v_cond[2], v_one, v_cond[2])),
+                            ("valu", ("+", v_cond[3], v_one, v_cond[3])),
+                            ("valu", ("+", v_cond[4], v_one, v_cond[4])),
+                            ("valu", ("+", v_cond[5], v_one, v_cond[5])),
+                            ("valu", ("+", v_cond[6], v_one, v_cond[6])),
+                            ("valu", ("+", v_cond[7], v_one, v_cond[7])),
+                        ]
+                        if next_b is not None:
+                            for _ in range(12):
+                                if alu_ops_done < 64:
+                                    j, k = divmod(alu_ops_done, VLEN)
+                                    slots_idx2.append(("alu", ("+", s_addr[j][k], self.scratch["forest_values_p"], v_idx[next_b][j] + k)))
+                                    alu_ops_done += 1
+                            for _ in range(2):
+                                if load_done < 16 and prev_alu_ops_done >= (load_done // VLEN + 1) * VLEN:
+                                    j, k = divmod(load_done, VLEN)
+                                    slots_idx2.append(("load", ("load", v_node_val[j] + k, s_addr[j][k])))
+                                    load_done += 1
+                        self.add_vliw(slots_idx2)
+                        prev_alu_ops_done = alu_ops_done
 
-                    slots_idx3 = [
-                        ("valu", ("multiply_add", v_idx[b][2], v_idx[b][2], v_two, v_cond[2])),
-                        ("valu", ("multiply_add", v_idx[b][3], v_idx[b][3], v_two, v_cond[3])),
-                        ("valu", ("multiply_add", v_idx[b][4], v_idx[b][4], v_two, v_cond[4])),
-                        ("valu", ("multiply_add", v_idx[b][5], v_idx[b][5], v_two, v_cond[5])),
-                        ("valu", ("multiply_add", v_idx[b][6], v_idx[b][6], v_two, v_cond[6])),
-                        ("valu", ("multiply_add", v_idx[b][7], v_idx[b][7], v_two, v_cond[7])),
-                    ]
-                    if next_b is not None:
-                        for _ in range(12):
-                            if alu_ops_done < 64:
-                                j, k = divmod(alu_ops_done, VLEN)
-                                slots_idx3.append(("alu", ("+", s_addr[j][k], self.scratch["forest_values_p"], v_idx[next_b][j] + k)))
-                                alu_ops_done += 1
-                        for _ in range(2):
-                            if load_done < 16 and prev_alu_ops_done >= (load_done // VLEN + 1) * VLEN:
-                                j, k = divmod(load_done, VLEN)
-                                slots_idx3.append(("load", ("load", v_node_val[j] + k, s_addr[j][k])))
-                                load_done += 1
-                    self.add_vliw(slots_idx3)
-                    prev_alu_ops_done = alu_ops_done
+                        slots_idx3 = [
+                            ("valu", ("multiply_add", v_idx[b][2], v_idx[b][2], v_two, v_cond[2])),
+                            ("valu", ("multiply_add", v_idx[b][3], v_idx[b][3], v_two, v_cond[3])),
+                            ("valu", ("multiply_add", v_idx[b][4], v_idx[b][4], v_two, v_cond[4])),
+                            ("valu", ("multiply_add", v_idx[b][5], v_idx[b][5], v_two, v_cond[5])),
+                            ("valu", ("multiply_add", v_idx[b][6], v_idx[b][6], v_two, v_cond[6])),
+                            ("valu", ("multiply_add", v_idx[b][7], v_idx[b][7], v_two, v_cond[7])),
+                        ]
+                        if next_b is not None:
+                            for _ in range(12):
+                                if alu_ops_done < 64:
+                                    j, k = divmod(alu_ops_done, VLEN)
+                                    slots_idx3.append(("alu", ("+", s_addr[j][k], self.scratch["forest_values_p"], v_idx[next_b][j] + k)))
+                                    alu_ops_done += 1
+                            for _ in range(2):
+                                if load_done < 16 and prev_alu_ops_done >= (load_done // VLEN + 1) * VLEN:
+                                    j, k = divmod(load_done, VLEN)
+                                    slots_idx3.append(("load", ("load", v_node_val[j] + k, s_addr[j][k])))
+                                    load_done += 1
+                        self.add_vliw(slots_idx3)
+                        prev_alu_ops_done = alu_ops_done
 
-                    slots_idx4 = [
-                        ("valu", ("<", v_tmp1[2], v_idx[b][2], v_n_nodes)),
-                        ("valu", ("<", v_tmp1[3], v_idx[b][3], v_n_nodes)),
-                        ("valu", ("<", v_tmp1[4], v_idx[b][4], v_n_nodes)),
-                        ("valu", ("<", v_tmp1[5], v_idx[b][5], v_n_nodes)),
-                        ("valu", ("<", v_tmp1[6], v_idx[b][6], v_n_nodes)),
-                        ("valu", ("<", v_tmp1[7], v_idx[b][7], v_n_nodes)),
-                    ]
-                    if next_b is not None:
-                        for _ in range(12):
-                            if alu_ops_done < 64:
-                                j, k = divmod(alu_ops_done, VLEN)
-                                slots_idx4.append(("alu", ("+", s_addr[j][k], self.scratch["forest_values_p"], v_idx[next_b][j] + k)))
-                                alu_ops_done += 1
-                        for _ in range(2):
-                            if load_done < 16 and prev_alu_ops_done >= (load_done // VLEN + 1) * VLEN:
-                                j, k = divmod(load_done, VLEN)
-                                slots_idx4.append(("load", ("load", v_node_val[j] + k, s_addr[j][k])))
-                                load_done += 1
-                    self.add_vliw(slots_idx4)
-                    prev_alu_ops_done = alu_ops_done
+                        slots_idx4 = [
+                            ("valu", ("<", v_tmp1[2], v_idx[b][2], v_n_nodes)),
+                            ("valu", ("<", v_tmp1[3], v_idx[b][3], v_n_nodes)),
+                            ("valu", ("<", v_tmp1[4], v_idx[b][4], v_n_nodes)),
+                            ("valu", ("<", v_tmp1[5], v_idx[b][5], v_n_nodes)),
+                            ("valu", ("<", v_tmp1[6], v_idx[b][6], v_n_nodes)),
+                            ("valu", ("<", v_tmp1[7], v_idx[b][7], v_n_nodes)),
+                        ]
+                        if next_b is not None:
+                            for _ in range(12):
+                                if alu_ops_done < 64:
+                                    j, k = divmod(alu_ops_done, VLEN)
+                                    slots_idx4.append(("alu", ("+", s_addr[j][k], self.scratch["forest_values_p"], v_idx[next_b][j] + k)))
+                                    alu_ops_done += 1
+                            for _ in range(2):
+                                if load_done < 16 and prev_alu_ops_done >= (load_done // VLEN + 1) * VLEN:
+                                    j, k = divmod(load_done, VLEN)
+                                    slots_idx4.append(("load", ("load", v_node_val[j] + k, s_addr[j][k])))
+                                    load_done += 1
+                        self.add_vliw(slots_idx4)
+                        prev_alu_ops_done = alu_ops_done
 
-                    slots_idx5 = [
-                        ("valu", ("*", v_idx[b][2], v_idx[b][2], v_tmp1[2])),
-                        ("valu", ("*", v_idx[b][3], v_idx[b][3], v_tmp1[3])),
-                        ("valu", ("*", v_idx[b][4], v_idx[b][4], v_tmp1[4])),
-                        ("valu", ("*", v_idx[b][5], v_idx[b][5], v_tmp1[5])),
-                        ("valu", ("*", v_idx[b][6], v_idx[b][6], v_tmp1[6])),
-                        ("valu", ("*", v_idx[b][7], v_idx[b][7], v_tmp1[7])),
-                    ]
-                    if next_b is not None:
-                        for _ in range(12):
-                            if alu_ops_done < 64:
-                                j, k = divmod(alu_ops_done, VLEN)
-                                slots_idx5.append(("alu", ("+", s_addr[j][k], self.scratch["forest_values_p"], v_idx[next_b][j] + k)))
-                                alu_ops_done += 1
-                        for _ in range(2):
-                            if load_done < 16 and prev_alu_ops_done >= (load_done // VLEN + 1) * VLEN:
-                                j, k = divmod(load_done, VLEN)
-                                slots_idx5.append(("load", ("load", v_node_val[j] + k, s_addr[j][k])))
-                                load_done += 1
-                    self.add_vliw(slots_idx5)
+                        slots_idx5 = [
+                            ("valu", ("*", v_idx[b][2], v_idx[b][2], v_tmp1[2])),
+                            ("valu", ("*", v_idx[b][3], v_idx[b][3], v_tmp1[3])),
+                            ("valu", ("*", v_idx[b][4], v_idx[b][4], v_tmp1[4])),
+                            ("valu", ("*", v_idx[b][5], v_idx[b][5], v_tmp1[5])),
+                            ("valu", ("*", v_idx[b][6], v_idx[b][6], v_tmp1[6])),
+                            ("valu", ("*", v_idx[b][7], v_idx[b][7], v_tmp1[7])),
+                        ]
+                        if next_b is not None:
+                            for _ in range(12):
+                                if alu_ops_done < 64:
+                                    j, k = divmod(alu_ops_done, VLEN)
+                                    slots_idx5.append(("alu", ("+", s_addr[j][k], self.scratch["forest_values_p"], v_idx[next_b][j] + k)))
+                                    alu_ops_done += 1
+                            for _ in range(2):
+                                if load_done < 16 and prev_alu_ops_done >= (load_done // VLEN + 1) * VLEN:
+                                    j, k = divmod(load_done, VLEN)
+                                    slots_idx5.append(("load", ("load", v_node_val[j] + k, s_addr[j][k])))
+                                    load_done += 1
+                        self.add_vliw(slots_idx5)
 
                     # Mark that we pre-pipelined for next round
                     if pipelining_for_next_round:
