@@ -472,15 +472,39 @@ class KernelBuilder:
                             ("valu", ("&", v_cond[j], v_idx[b][j], v_one)),
                             ("valu", ("&", v_cond[j+1], v_idx[b][j+1], v_one)),
                         ])
-                    # vselect (1 per cycle due to flow engine limit)
-                    for j in range(UNROLL):
-                        self.add("flow", ("vselect", v_node_val[j], v_cond[j], v_level1_0, v_level1_1))
-                    # XOR
-                    for j in range(0, UNROLL, 2):
-                        self.add_vliw([
-                            ("valu", ("^", v_hash[b][j], v_hash[b][j], v_node_val[j])),
-                            ("valu", ("^", v_hash[b][j+1], v_hash[b][j+1], v_node_val[j+1])),
-                        ])
+                    # Pipeline vselect with XOR (saves 3 cycles: 9 vs 12)
+                    # vselect[0], vselect[1] first to get results ready
+                    self.add("flow", ("vselect", v_node_val[0], v_cond[0], v_level1_0, v_level1_1))
+                    self.add("flow", ("vselect", v_node_val[1], v_cond[1], v_level1_0, v_level1_1))
+                    # vselect[2] + XOR[0,1]
+                    self.add_vliw([
+                        ("flow", ("vselect", v_node_val[2], v_cond[2], v_level1_0, v_level1_1)),
+                        ("valu", ("^", v_hash[b][0], v_hash[b][0], v_node_val[0])),
+                        ("valu", ("^", v_hash[b][1], v_hash[b][1], v_node_val[1])),
+                    ])
+                    # vselect[3]
+                    self.add("flow", ("vselect", v_node_val[3], v_cond[3], v_level1_0, v_level1_1))
+                    # vselect[4] + XOR[2,3]
+                    self.add_vliw([
+                        ("flow", ("vselect", v_node_val[4], v_cond[4], v_level1_0, v_level1_1)),
+                        ("valu", ("^", v_hash[b][2], v_hash[b][2], v_node_val[2])),
+                        ("valu", ("^", v_hash[b][3], v_hash[b][3], v_node_val[3])),
+                    ])
+                    # vselect[5]
+                    self.add("flow", ("vselect", v_node_val[5], v_cond[5], v_level1_0, v_level1_1))
+                    # vselect[6] + XOR[4,5]
+                    self.add_vliw([
+                        ("flow", ("vselect", v_node_val[6], v_cond[6], v_level1_0, v_level1_1)),
+                        ("valu", ("^", v_hash[b][4], v_hash[b][4], v_node_val[4])),
+                        ("valu", ("^", v_hash[b][5], v_hash[b][5], v_node_val[5])),
+                    ])
+                    # vselect[7]
+                    self.add("flow", ("vselect", v_node_val[7], v_cond[7], v_level1_0, v_level1_1))
+                    # XOR[6,7]
+                    self.add_vliw([
+                        ("valu", ("^", v_hash[b][6], v_hash[b][6], v_node_val[6])),
+                        ("valu", ("^", v_hash[b][7], v_hash[b][7], v_node_val[7])),
+                    ])
                     # Hash with multiply_add fusion
                     self.emit_hash_8vec(v_hash[b], v_tmp1, v_tmp2, v_hash_const1, v_hash_const3, v_hash_mult)
                     # Index calc
@@ -749,41 +773,111 @@ class KernelBuilder:
             else:
                 # Normal round: indirect loads required
                 for b in range(N_SUB_BATCHES):
-                    # Address calculation
-                    for j in range(0, UNROLL, 2):
-                        self.add_vliw([
-                            ("alu", ("+", s_addr[j][0], self.scratch["forest_values_p"], v_idx[b][j] + 0)),
-                            ("alu", ("+", s_addr[j][1], self.scratch["forest_values_p"], v_idx[b][j] + 1)),
-                            ("alu", ("+", s_addr[j][2], self.scratch["forest_values_p"], v_idx[b][j] + 2)),
-                            ("alu", ("+", s_addr[j][3], self.scratch["forest_values_p"], v_idx[b][j] + 3)),
-                            ("alu", ("+", s_addr[j][4], self.scratch["forest_values_p"], v_idx[b][j] + 4)),
-                            ("alu", ("+", s_addr[j][5], self.scratch["forest_values_p"], v_idx[b][j] + 5)),
-                            ("alu", ("+", s_addr[j][6], self.scratch["forest_values_p"], v_idx[b][j] + 6)),
-                            ("alu", ("+", s_addr[j][7], self.scratch["forest_values_p"], v_idx[b][j] + 7)),
-                            ("alu", ("+", s_addr[j+1][0], self.scratch["forest_values_p"], v_idx[b][j+1] + 0)),
-                            ("alu", ("+", s_addr[j+1][1], self.scratch["forest_values_p"], v_idx[b][j+1] + 1)),
-                            ("alu", ("+", s_addr[j+1][2], self.scratch["forest_values_p"], v_idx[b][j+1] + 2)),
-                            ("alu", ("+", s_addr[j+1][3], self.scratch["forest_values_p"], v_idx[b][j+1] + 3)),
-                        ])
-                        self.add_vliw([
-                            ("alu", ("+", s_addr[j+1][4], self.scratch["forest_values_p"], v_idx[b][j+1] + 4)),
-                            ("alu", ("+", s_addr[j+1][5], self.scratch["forest_values_p"], v_idx[b][j+1] + 5)),
-                            ("alu", ("+", s_addr[j+1][6], self.scratch["forest_values_p"], v_idx[b][j+1] + 6)),
-                            ("alu", ("+", s_addr[j+1][7], self.scratch["forest_values_p"], v_idx[b][j+1] + 7)),
-                        ])
+                    # Address calculation for v0-v1 only (needed before loads)
+                    self.add_vliw([
+                        ("alu", ("+", s_addr[0][0], self.scratch["forest_values_p"], v_idx[b][0] + 0)),
+                        ("alu", ("+", s_addr[0][1], self.scratch["forest_values_p"], v_idx[b][0] + 1)),
+                        ("alu", ("+", s_addr[0][2], self.scratch["forest_values_p"], v_idx[b][0] + 2)),
+                        ("alu", ("+", s_addr[0][3], self.scratch["forest_values_p"], v_idx[b][0] + 3)),
+                        ("alu", ("+", s_addr[0][4], self.scratch["forest_values_p"], v_idx[b][0] + 4)),
+                        ("alu", ("+", s_addr[0][5], self.scratch["forest_values_p"], v_idx[b][0] + 5)),
+                        ("alu", ("+", s_addr[0][6], self.scratch["forest_values_p"], v_idx[b][0] + 6)),
+                        ("alu", ("+", s_addr[0][7], self.scratch["forest_values_p"], v_idx[b][0] + 7)),
+                        ("alu", ("+", s_addr[1][0], self.scratch["forest_values_p"], v_idx[b][1] + 0)),
+                        ("alu", ("+", s_addr[1][1], self.scratch["forest_values_p"], v_idx[b][1] + 1)),
+                        ("alu", ("+", s_addr[1][2], self.scratch["forest_values_p"], v_idx[b][1] + 2)),
+                        ("alu", ("+", s_addr[1][3], self.scratch["forest_values_p"], v_idx[b][1] + 3)),
+                    ])
+                    self.add_vliw([
+                        ("alu", ("+", s_addr[1][4], self.scratch["forest_values_p"], v_idx[b][1] + 4)),
+                        ("alu", ("+", s_addr[1][5], self.scratch["forest_values_p"], v_idx[b][1] + 5)),
+                        ("alu", ("+", s_addr[1][6], self.scratch["forest_values_p"], v_idx[b][1] + 6)),
+                        ("alu", ("+", s_addr[1][7], self.scratch["forest_values_p"], v_idx[b][1] + 7)),
+                    ])
 
-                    # Load node values with hash overlap
-                    # Load v0-v1 first
-                    for k in range(0, VLEN, 2):
-                        self.add_vliw([
-                            ("load", ("load", v_node_val[0] + k, s_addr[0][k])),
-                            ("load", ("load", v_node_val[0] + k + 1, s_addr[0][k + 1])),
-                        ])
-                    for k in range(0, VLEN, 2):
-                        self.add_vliw([
-                            ("load", ("load", v_node_val[1] + k, s_addr[1][k])),
-                            ("load", ("load", v_node_val[1] + k + 1, s_addr[1][k + 1])),
-                        ])
+                    # Load v0-v1 while computing addresses for v2-v7
+                    # v0 loads + v2-v3 address calc
+                    self.add_vliw([
+                        ("load", ("load", v_node_val[0] + 0, s_addr[0][0])),
+                        ("load", ("load", v_node_val[0] + 1, s_addr[0][1])),
+                        ("alu", ("+", s_addr[2][0], self.scratch["forest_values_p"], v_idx[b][2] + 0)),
+                        ("alu", ("+", s_addr[2][1], self.scratch["forest_values_p"], v_idx[b][2] + 1)),
+                        ("alu", ("+", s_addr[2][2], self.scratch["forest_values_p"], v_idx[b][2] + 2)),
+                        ("alu", ("+", s_addr[2][3], self.scratch["forest_values_p"], v_idx[b][2] + 3)),
+                        ("alu", ("+", s_addr[2][4], self.scratch["forest_values_p"], v_idx[b][2] + 4)),
+                        ("alu", ("+", s_addr[2][5], self.scratch["forest_values_p"], v_idx[b][2] + 5)),
+                        ("alu", ("+", s_addr[2][6], self.scratch["forest_values_p"], v_idx[b][2] + 6)),
+                        ("alu", ("+", s_addr[2][7], self.scratch["forest_values_p"], v_idx[b][2] + 7)),
+                        ("alu", ("+", s_addr[3][0], self.scratch["forest_values_p"], v_idx[b][3] + 0)),
+                        ("alu", ("+", s_addr[3][1], self.scratch["forest_values_p"], v_idx[b][3] + 1)),
+                    ])
+                    self.add_vliw([
+                        ("load", ("load", v_node_val[0] + 2, s_addr[0][2])),
+                        ("load", ("load", v_node_val[0] + 3, s_addr[0][3])),
+                        ("alu", ("+", s_addr[3][2], self.scratch["forest_values_p"], v_idx[b][3] + 2)),
+                        ("alu", ("+", s_addr[3][3], self.scratch["forest_values_p"], v_idx[b][3] + 3)),
+                        ("alu", ("+", s_addr[3][4], self.scratch["forest_values_p"], v_idx[b][3] + 4)),
+                        ("alu", ("+", s_addr[3][5], self.scratch["forest_values_p"], v_idx[b][3] + 5)),
+                        ("alu", ("+", s_addr[3][6], self.scratch["forest_values_p"], v_idx[b][3] + 6)),
+                        ("alu", ("+", s_addr[3][7], self.scratch["forest_values_p"], v_idx[b][3] + 7)),
+                        ("alu", ("+", s_addr[4][0], self.scratch["forest_values_p"], v_idx[b][4] + 0)),
+                        ("alu", ("+", s_addr[4][1], self.scratch["forest_values_p"], v_idx[b][4] + 1)),
+                        ("alu", ("+", s_addr[4][2], self.scratch["forest_values_p"], v_idx[b][4] + 2)),
+                        ("alu", ("+", s_addr[4][3], self.scratch["forest_values_p"], v_idx[b][4] + 3)),
+                    ])
+                    self.add_vliw([
+                        ("load", ("load", v_node_val[0] + 4, s_addr[0][4])),
+                        ("load", ("load", v_node_val[0] + 5, s_addr[0][5])),
+                        ("alu", ("+", s_addr[4][4], self.scratch["forest_values_p"], v_idx[b][4] + 4)),
+                        ("alu", ("+", s_addr[4][5], self.scratch["forest_values_p"], v_idx[b][4] + 5)),
+                        ("alu", ("+", s_addr[4][6], self.scratch["forest_values_p"], v_idx[b][4] + 6)),
+                        ("alu", ("+", s_addr[4][7], self.scratch["forest_values_p"], v_idx[b][4] + 7)),
+                        ("alu", ("+", s_addr[5][0], self.scratch["forest_values_p"], v_idx[b][5] + 0)),
+                        ("alu", ("+", s_addr[5][1], self.scratch["forest_values_p"], v_idx[b][5] + 1)),
+                        ("alu", ("+", s_addr[5][2], self.scratch["forest_values_p"], v_idx[b][5] + 2)),
+                        ("alu", ("+", s_addr[5][3], self.scratch["forest_values_p"], v_idx[b][5] + 3)),
+                        ("alu", ("+", s_addr[5][4], self.scratch["forest_values_p"], v_idx[b][5] + 4)),
+                        ("alu", ("+", s_addr[5][5], self.scratch["forest_values_p"], v_idx[b][5] + 5)),
+                    ])
+                    self.add_vliw([
+                        ("load", ("load", v_node_val[0] + 6, s_addr[0][6])),
+                        ("load", ("load", v_node_val[0] + 7, s_addr[0][7])),
+                        ("alu", ("+", s_addr[5][6], self.scratch["forest_values_p"], v_idx[b][5] + 6)),
+                        ("alu", ("+", s_addr[5][7], self.scratch["forest_values_p"], v_idx[b][5] + 7)),
+                        ("alu", ("+", s_addr[6][0], self.scratch["forest_values_p"], v_idx[b][6] + 0)),
+                        ("alu", ("+", s_addr[6][1], self.scratch["forest_values_p"], v_idx[b][6] + 1)),
+                        ("alu", ("+", s_addr[6][2], self.scratch["forest_values_p"], v_idx[b][6] + 2)),
+                        ("alu", ("+", s_addr[6][3], self.scratch["forest_values_p"], v_idx[b][6] + 3)),
+                        ("alu", ("+", s_addr[6][4], self.scratch["forest_values_p"], v_idx[b][6] + 4)),
+                        ("alu", ("+", s_addr[6][5], self.scratch["forest_values_p"], v_idx[b][6] + 5)),
+                        ("alu", ("+", s_addr[6][6], self.scratch["forest_values_p"], v_idx[b][6] + 6)),
+                        ("alu", ("+", s_addr[6][7], self.scratch["forest_values_p"], v_idx[b][6] + 7)),
+                    ])
+                    # v1 loads + v7 address calc
+                    self.add_vliw([
+                        ("load", ("load", v_node_val[1] + 0, s_addr[1][0])),
+                        ("load", ("load", v_node_val[1] + 1, s_addr[1][1])),
+                        ("alu", ("+", s_addr[7][0], self.scratch["forest_values_p"], v_idx[b][7] + 0)),
+                        ("alu", ("+", s_addr[7][1], self.scratch["forest_values_p"], v_idx[b][7] + 1)),
+                        ("alu", ("+", s_addr[7][2], self.scratch["forest_values_p"], v_idx[b][7] + 2)),
+                        ("alu", ("+", s_addr[7][3], self.scratch["forest_values_p"], v_idx[b][7] + 3)),
+                        ("alu", ("+", s_addr[7][4], self.scratch["forest_values_p"], v_idx[b][7] + 4)),
+                        ("alu", ("+", s_addr[7][5], self.scratch["forest_values_p"], v_idx[b][7] + 5)),
+                        ("alu", ("+", s_addr[7][6], self.scratch["forest_values_p"], v_idx[b][7] + 6)),
+                        ("alu", ("+", s_addr[7][7], self.scratch["forest_values_p"], v_idx[b][7] + 7)),
+                    ])
+                    self.add_vliw([
+                        ("load", ("load", v_node_val[1] + 2, s_addr[1][2])),
+                        ("load", ("load", v_node_val[1] + 3, s_addr[1][3])),
+                    ])
+                    self.add_vliw([
+                        ("load", ("load", v_node_val[1] + 4, s_addr[1][4])),
+                        ("load", ("load", v_node_val[1] + 5, s_addr[1][5])),
+                    ])
+                    self.add_vliw([
+                        ("load", ("load", v_node_val[1] + 6, s_addr[1][6])),
+                        ("load", ("load", v_node_val[1] + 7, s_addr[1][7])),
+                    ])
 
                     # XOR v0-v1 and start hash while loading v2-v7
                     self.add_vliw([
