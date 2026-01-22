@@ -58,6 +58,16 @@ class KernelBuilder:
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
 
+    def add_vliw(self, slots):
+        """Add a VLIW instruction bundle with multiple engine slots."""
+        instr = {}
+        for engine, slot in slots:
+            if engine not in instr:
+                instr[engine] = []
+            instr[engine].append(slot)
+        if instr:
+            self.instrs.append(instr)
+
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
         if name is not None:
@@ -89,21 +99,19 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
+        Optimized VLIW SIMD kernel with deep pipelining.
+        Key insight: 64 indirect loads (32 cycles) can overlap with ALL hash computation.
         """
+        UNROLL = 8  # Process 8 vectors per batch iteration (64 elements)
+
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
         tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
+
+        # Scratch space addresses for init vars
         init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
+            "rounds", "n_nodes", "batch_size", "forest_height",
+            "forest_values_p", "inp_indices_p", "inp_values_p",
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
@@ -111,66 +119,295 @@ class KernelBuilder:
             self.add("load", ("const", tmp1, i))
             self.add("load", ("load", self.scratch[v], tmp1))
 
+        # Allocate vector scratch space for UNROLL=8 vectors
+        v_idx = [self.alloc_scratch(f"v_idx_{j}", VLEN) for j in range(UNROLL)]
+        v_hash = [self.alloc_scratch(f"v_hash_{j}", VLEN) for j in range(UNROLL)]
+        v_node_val = [self.alloc_scratch(f"v_node_val_{j}", VLEN) for j in range(UNROLL)]
+        v_tmp1 = [self.alloc_scratch(f"v_tmp1_{j}", VLEN) for j in range(UNROLL)]
+        v_tmp2 = [self.alloc_scratch(f"v_tmp2_{j}", VLEN) for j in range(UNROLL)]
+        v_cond = [self.alloc_scratch(f"v_cond_{j}", VLEN) for j in range(UNROLL)]
+
+        # Scalar addresses for indirect loads (8 per vector)
+        s_addr = [[self.alloc_scratch(f"s_addr_{j}_{k}") for k in range(VLEN)] for j in range(UNROLL)]
+
+        # Address base registers
+        addr_base_idx = [self.alloc_scratch(f"addr_base_idx_{j}") for j in range(UNROLL)]
+        addr_base_val = [self.alloc_scratch(f"addr_base_val_{j}") for j in range(UNROLL)]
+
+        # Constants
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
+        # Pre-broadcast hash constants to vectors
+        v_hash_const1 = []
+        v_hash_const3 = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            vc1 = self.alloc_scratch(f"v_hash_c1_{hi}", VLEN)
+            vc3 = self.alloc_scratch(f"v_hash_c3_{hi}", VLEN)
+            v_hash_const1.append(vc1)
+            v_hash_const3.append(vc3)
+            c1_scalar = self.scratch_const(val1)
+            c3_scalar = self.scratch_const(val3)
+            self.add("valu", ("vbroadcast", vc1, c1_scalar))
+            self.add("valu", ("vbroadcast", vc3, c3_scalar))
+
+        # Broadcast constants for index calculation
+        v_zero = self.alloc_scratch("v_zero", VLEN)
+        v_one = self.alloc_scratch("v_one", VLEN)
+        v_two = self.alloc_scratch("v_two", VLEN)
+        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
+        self.add("valu", ("vbroadcast", v_zero, zero_const))
+        self.add("valu", ("vbroadcast", v_one, one_const))
+        self.add("valu", ("vbroadcast", v_two, two_const))
+        self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
+
         self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
+        self.add("debug", ("comment", "Starting optimized VLIW SIMD loop"))
 
-        body = []  # array of slots
+        n_batches = batch_size // (UNROLL * VLEN)  # 256 / 64 = 4
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        for batch in range(n_batches):
+            base_offset = batch * UNROLL * VLEN
 
-        for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+            for rnd in range(rounds):
+                # ============================================================
+                # PHASE 1: Setup address bases and load v_idx, v_hash (round 0 only)
+                # ============================================================
+                if rnd == 0:
+                    for j in range(UNROLL):
+                        offset = base_offset + j * VLEN
+                        offset_const = self.scratch_const(offset)
+                        self.add_vliw([
+                            ("alu", ("+", addr_base_idx[j], self.scratch["inp_indices_p"], offset_const)),
+                            ("alu", ("+", addr_base_val[j], self.scratch["inp_values_p"], offset_const)),
+                        ])
+                    for j in range(0, UNROLL, 2):
+                        self.add_vliw([
+                            ("load", ("vload", v_idx[j], addr_base_idx[j])),
+                            ("load", ("vload", v_idx[j+1], addr_base_idx[j+1])),
+                        ])
+                    for j in range(0, UNROLL, 2):
+                        self.add_vliw([
+                            ("load", ("vload", v_hash[j], addr_base_val[j])),
+                            ("load", ("vload", v_hash[j+1], addr_base_val[j+1])),
+                        ])
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
+                # ============================================================
+                # PHASE 2: Compute indirect addresses (use 8 ALU ops per cycle)
+                # 64 addresses, 8 per cycle = 8 cycles
+                # ============================================================
+                for j in range(0, UNROLL, 1):
+                    self.add_vliw([
+                        ("alu", ("+", s_addr[j][0], self.scratch["forest_values_p"], v_idx[j] + 0)),
+                        ("alu", ("+", s_addr[j][1], self.scratch["forest_values_p"], v_idx[j] + 1)),
+                        ("alu", ("+", s_addr[j][2], self.scratch["forest_values_p"], v_idx[j] + 2)),
+                        ("alu", ("+", s_addr[j][3], self.scratch["forest_values_p"], v_idx[j] + 3)),
+                        ("alu", ("+", s_addr[j][4], self.scratch["forest_values_p"], v_idx[j] + 4)),
+                        ("alu", ("+", s_addr[j][5], self.scratch["forest_values_p"], v_idx[j] + 5)),
+                        ("alu", ("+", s_addr[j][6], self.scratch["forest_values_p"], v_idx[j] + 6)),
+                        ("alu", ("+", s_addr[j][7], self.scratch["forest_values_p"], v_idx[j] + 7)),
+                    ])
+
+                # ============================================================
+                # PHASE 3: Indirect loads with interleaved XOR and hash
+                # Strategy: Load v0-v1 (8 cycles), then interleave v2-v7 loads
+                # with v0-v1 hash computation
+                # ============================================================
+
+                # Load v0 and v1 node values (8 cycles)
+                for k in range(0, VLEN, 2):
+                    self.add_vliw([
+                        ("load", ("load", v_node_val[0] + k, s_addr[0][k])),
+                        ("load", ("load", v_node_val[0] + k + 1, s_addr[0][k + 1])),
+                    ])
+                for k in range(0, VLEN, 2):
+                    self.add_vliw([
+                        ("load", ("load", v_node_val[1] + k, s_addr[1][k])),
+                        ("load", ("load", v_node_val[1] + k + 1, s_addr[1][k + 1])),
+                    ])
+
+                # XOR v0 and v1
+                self.add_vliw([
+                    ("valu", ("^", v_hash[0], v_hash[0], v_node_val[0])),
+                    ("valu", ("^", v_hash[1], v_hash[1], v_node_val[1])),
+                ])
+
+                # Hash v0-v1 while loading v2-v7
+                load_j, load_k = 2, 0
+
+                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                    # Cycle 1: tmp1 and tmp2 for v0-v1
+                    slots = [
+                        ("valu", (op1, v_tmp1[0], v_hash[0], v_hash_const1[hi])),
+                        ("valu", (op3, v_tmp2[0], v_hash[0], v_hash_const3[hi])),
+                        ("valu", (op1, v_tmp1[1], v_hash[1], v_hash_const1[hi])),
+                        ("valu", (op3, v_tmp2[1], v_hash[1], v_hash_const3[hi])),
+                    ]
+                    if load_j < UNROLL:
+                        slots.append(("load", ("load", v_node_val[load_j] + load_k, s_addr[load_j][load_k])))
+                        load_k += 1
+                        if load_k >= VLEN:
+                            load_k = 0
+                            load_j += 1
+                    if load_j < UNROLL:
+                        slots.append(("load", ("load", v_node_val[load_j] + load_k, s_addr[load_j][load_k])))
+                        load_k += 1
+                        if load_k >= VLEN:
+                            load_k = 0
+                            load_j += 1
+                    self.add_vliw(slots)
+
+                    # Cycle 2: combine for v0-v1
+                    slots = [
+                        ("valu", (op2, v_hash[0], v_tmp1[0], v_tmp2[0])),
+                        ("valu", (op2, v_hash[1], v_tmp1[1], v_tmp2[1])),
+                    ]
+                    if load_j < UNROLL:
+                        slots.append(("load", ("load", v_node_val[load_j] + load_k, s_addr[load_j][load_k])))
+                        load_k += 1
+                        if load_k >= VLEN:
+                            load_k = 0
+                            load_j += 1
+                    if load_j < UNROLL:
+                        slots.append(("load", ("load", v_node_val[load_j] + load_k, s_addr[load_j][load_k])))
+                        load_k += 1
+                        if load_k >= VLEN:
+                            load_k = 0
+                            load_j += 1
+                    self.add_vliw(slots)
+
+                # Finish remaining loads
+                while load_j < UNROLL:
+                    slots = []
+                    for _ in range(2):
+                        if load_j < UNROLL:
+                            slots.append(("load", ("load", v_node_val[load_j] + load_k, s_addr[load_j][load_k])))
+                            load_k += 1
+                            if load_k >= VLEN:
+                                load_k = 0
+                                load_j += 1
+                    if slots:
+                        self.add_vliw(slots)
+
+                # XOR v2-v7
+                for j in range(2, UNROLL, 2):
+                    self.add_vliw([
+                        ("valu", ("^", v_hash[j], v_hash[j], v_node_val[j])),
+                        ("valu", ("^", v_hash[j+1], v_hash[j+1], v_node_val[j+1])),
+                    ])
+
+                # Hash v2-v7 while overlapping v0-v1 index calculation
+                # Index calc for v0-v1 needs: &, +, multiply_add, <, * = 5 ops each
+                # We have 18 cycles for v2-v7 hash, can fit v0-v1 index calc (10 ops)
+
+                # v0-v1 index step 1: val & 1
+                self.add_vliw([
+                    ("valu", (HASH_STAGES[0][0], v_tmp1[2], v_hash[2], v_hash_const1[0])),
+                    ("valu", (HASH_STAGES[0][3], v_tmp2[2], v_hash[2], v_hash_const3[0])),
+                    ("valu", (HASH_STAGES[0][0], v_tmp1[3], v_hash[3], v_hash_const1[0])),
+                    ("valu", (HASH_STAGES[0][3], v_tmp2[3], v_hash[3], v_hash_const3[0])),
+                    ("valu", ("&", v_cond[0], v_hash[0], v_one)),
+                    ("valu", ("&", v_cond[1], v_hash[1], v_one)),
+                ])
+                self.add_vliw([
+                    ("valu", (HASH_STAGES[0][0], v_tmp1[4], v_hash[4], v_hash_const1[0])),
+                    ("valu", (HASH_STAGES[0][3], v_tmp2[4], v_hash[4], v_hash_const3[0])),
+                    ("valu", (HASH_STAGES[0][0], v_tmp1[5], v_hash[5], v_hash_const1[0])),
+                    ("valu", (HASH_STAGES[0][3], v_tmp2[5], v_hash[5], v_hash_const3[0])),
+                    ("valu", ("+", v_cond[0], v_one, v_cond[0])),
+                    ("valu", ("+", v_cond[1], v_one, v_cond[1])),
+                ])
+                self.add_vliw([
+                    ("valu", (HASH_STAGES[0][0], v_tmp1[6], v_hash[6], v_hash_const1[0])),
+                    ("valu", (HASH_STAGES[0][3], v_tmp2[6], v_hash[6], v_hash_const3[0])),
+                    ("valu", (HASH_STAGES[0][0], v_tmp1[7], v_hash[7], v_hash_const1[0])),
+                    ("valu", (HASH_STAGES[0][3], v_tmp2[7], v_hash[7], v_hash_const3[0])),
+                    ("valu", ("multiply_add", v_idx[0], v_idx[0], v_two, v_cond[0])),
+                    ("valu", ("multiply_add", v_idx[1], v_idx[1], v_two, v_cond[1])),
+                ])
+                self.add_vliw([
+                    ("valu", (HASH_STAGES[0][2], v_hash[2], v_tmp1[2], v_tmp2[2])),
+                    ("valu", (HASH_STAGES[0][2], v_hash[3], v_tmp1[3], v_tmp2[3])),
+                    ("valu", (HASH_STAGES[0][2], v_hash[4], v_tmp1[4], v_tmp2[4])),
+                    ("valu", (HASH_STAGES[0][2], v_hash[5], v_tmp1[5], v_tmp2[5])),
+                    ("valu", ("<", v_cond[0], v_idx[0], v_n_nodes)),
+                    ("valu", ("<", v_cond[1], v_idx[1], v_n_nodes)),
+                ])
+                self.add_vliw([
+                    ("valu", (HASH_STAGES[0][2], v_hash[6], v_tmp1[6], v_tmp2[6])),
+                    ("valu", (HASH_STAGES[0][2], v_hash[7], v_tmp1[7], v_tmp2[7])),
+                    ("valu", ("*", v_idx[0], v_idx[0], v_cond[0])),
+                    ("valu", ("*", v_idx[1], v_idx[1], v_cond[1])),
+                ])
+
+                # Hash stages 1-5 for v2-v7 with v2-v7 index calc overlap
+                for hi in range(1, 6):
+                    op1, val1, op2, op3, val3 = HASH_STAGES[hi]
+                    self.add_vliw([
+                        ("valu", (op1, v_tmp1[2], v_hash[2], v_hash_const1[hi])),
+                        ("valu", (op3, v_tmp2[2], v_hash[2], v_hash_const3[hi])),
+                        ("valu", (op1, v_tmp1[3], v_hash[3], v_hash_const1[hi])),
+                        ("valu", (op3, v_tmp2[3], v_hash[3], v_hash_const3[hi])),
+                        ("valu", (op1, v_tmp1[4], v_hash[4], v_hash_const1[hi])),
+                        ("valu", (op3, v_tmp2[4], v_hash[4], v_hash_const3[hi])),
+                    ])
+                    self.add_vliw([
+                        ("valu", (op1, v_tmp1[5], v_hash[5], v_hash_const1[hi])),
+                        ("valu", (op3, v_tmp2[5], v_hash[5], v_hash_const3[hi])),
+                        ("valu", (op1, v_tmp1[6], v_hash[6], v_hash_const1[hi])),
+                        ("valu", (op3, v_tmp2[6], v_hash[6], v_hash_const3[hi])),
+                        ("valu", (op1, v_tmp1[7], v_hash[7], v_hash_const1[hi])),
+                        ("valu", (op3, v_tmp2[7], v_hash[7], v_hash_const3[hi])),
+                    ])
+                    self.add_vliw([
+                        ("valu", (op2, v_hash[2], v_tmp1[2], v_tmp2[2])),
+                        ("valu", (op2, v_hash[3], v_tmp1[3], v_tmp2[3])),
+                        ("valu", (op2, v_hash[4], v_tmp1[4], v_tmp2[4])),
+                        ("valu", (op2, v_hash[5], v_tmp1[5], v_tmp2[5])),
+                        ("valu", (op2, v_hash[6], v_tmp1[6], v_tmp2[6])),
+                        ("valu", (op2, v_hash[7], v_tmp1[7], v_tmp2[7])),
+                    ])
+
+                # ============================================================
+                # PHASE 4: Index calculation for v2-v7 (10 cycles)
+                # ============================================================
+                for j in range(2, UNROLL, 2):
+                    self.add_vliw([
+                        ("valu", ("&", v_cond[j], v_hash[j], v_one)),
+                        ("valu", ("&", v_cond[j+1], v_hash[j+1], v_one)),
+                    ])
+                for j in range(2, UNROLL, 2):
+                    self.add_vliw([
+                        ("valu", ("+", v_cond[j], v_one, v_cond[j])),
+                        ("valu", ("+", v_cond[j+1], v_one, v_cond[j+1])),
+                    ])
+                for j in range(2, UNROLL, 2):
+                    self.add_vliw([
+                        ("valu", ("multiply_add", v_idx[j], v_idx[j], v_two, v_cond[j])),
+                        ("valu", ("multiply_add", v_idx[j+1], v_idx[j+1], v_two, v_cond[j+1])),
+                    ])
+                for j in range(2, UNROLL, 2):
+                    self.add_vliw([
+                        ("valu", ("<", v_tmp1[j], v_idx[j], v_n_nodes)),
+                        ("valu", ("<", v_tmp1[j+1], v_idx[j+1], v_n_nodes)),
+                    ])
+                for j in range(2, UNROLL, 2):
+                    self.add_vliw([
+                        ("valu", ("*", v_idx[j], v_idx[j], v_tmp1[j])),
+                        ("valu", ("*", v_idx[j+1], v_idx[j+1], v_tmp1[j+1])),
+                    ])
+
+                # ============================================================
+                # PHASE 5: Store (only on last round)
+                # ============================================================
+                if rnd == rounds - 1:
+                    for j in range(0, UNROLL, 2):
+                        self.add_vliw([
+                            ("store", ("vstore", addr_base_val[j], v_hash[j])),
+                            ("store", ("vstore", addr_base_val[j+1], v_hash[j+1])),
+                        ])
+
         self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
